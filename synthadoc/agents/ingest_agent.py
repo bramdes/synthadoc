@@ -245,7 +245,7 @@ class IngestAgent:
         p = self._wiki_root / "wiki" / "purpose.md"
         if not p.exists():
             return ""
-        return p.read_text(encoding="utf-8")[:500]
+        return p.read_text(encoding="utf-8")
 
     def _hash(self, path: str) -> tuple[str, int]:
         data = Path(path).read_bytes()
