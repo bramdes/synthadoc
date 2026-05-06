@@ -3,6 +3,27 @@
 from __future__ import annotations
 
 import json
+from pathlib import Path
+from typing import Optional
+
+
+def load_user_context(wiki_root: Optional[Path]) -> str:
+    """Combine AGENTS.md and wiki/purpose.md into a system-prompt string.
+
+    Used by ingest and query agents so the LLM sees the wiki's audience,
+    behavior guidelines, and scope on every personalized call. Re-read on
+    each call so edits take effect without restarting the server.
+    """
+    if wiki_root is None:
+        return ""
+    parts = []
+    agents = Path(wiki_root) / "AGENTS.md"
+    if agents.exists():
+        parts.append(agents.read_text(encoding="utf-8").strip())
+    purpose = Path(wiki_root) / "wiki" / "purpose.md"
+    if purpose.exists():
+        parts.append(purpose.read_text(encoding="utf-8").strip())
+    return "\n\n---\n\n".join(p for p in parts if p)
 
 
 def parse_json_string_array(text: str, max_items: int) -> list[str] | None:

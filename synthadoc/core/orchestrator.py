@@ -296,6 +296,7 @@ class Orchestrator:
             provider=_provider,
             store=self._store, search=self._search,
             gap_score_threshold=self._cfg.query.gap_score_threshold,
+            wiki_root=self._root,
         ).query(question)
         _model = self._cfg.agents.resolve("query").model
         cost_usd = estimate_cost(

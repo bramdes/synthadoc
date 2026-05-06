@@ -5,8 +5,10 @@ from __future__ import annotations
 import asyncio
 import logging
 from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Optional
 
-from synthadoc.agents._utils import parse_json_string_array
+from synthadoc.agents._utils import load_user_context, parse_json_string_array
 from synthadoc.agents.search_decompose_agent import SearchDecomposeAgent
 from synthadoc.providers.base import LLMProvider, Message
 from synthadoc.storage.search import HybridSearch
@@ -47,12 +49,14 @@ class QueryResult:
 class QueryAgent:
     def __init__(self, provider: LLMProvider, store: WikiStorage,
                  search: HybridSearch, top_n: int = 8,
-                 gap_score_threshold: float = 2.0) -> None:
+                 gap_score_threshold: float = 2.0,
+                 wiki_root: Optional[Path] = None) -> None:
         self._provider = provider
         self._store = store
         self._search = search
         self._top_n = top_n
         self._gap_score_threshold = gap_score_threshold
+        self._wiki_root = Path(wiki_root) if wiki_root is not None else None
 
     async def decompose(self, question: str) -> list[str]:
         """Break a question into focused sub-questions for independent retrieval.
@@ -228,6 +232,7 @@ class QueryAgent:
             messages=[Message(role="user",
                 content=f"Answer using ONLY these wiki pages. Cite with [[PageTitle]].\n\n"
                         f"Question: {question}\n\nPages:\n{context}")],
+            system=load_user_context(self._wiki_root) or None,
             temperature=0.0,
         )
         logger.info("query answered — %d page(s) cited, %d tokens",
