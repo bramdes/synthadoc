@@ -8,7 +8,7 @@ import aiosqlite
 
 # Default cache version — overridden by [cache] version in config.toml.
 # Users can bump this in config without touching source code.
-CACHE_VERSION = "4"
+CACHE_VERSION = "5"
 
 
 def make_cache_key(operation: str, inputs: dict, version: str = CACHE_VERSION) -> str:

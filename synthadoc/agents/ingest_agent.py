@@ -13,6 +13,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
+from synthadoc.agents._utils import load_user_context
 from synthadoc.agents.search_decompose_agent import SearchDecomposeAgent
 from synthadoc.agents.skill_agent import SkillAgent
 from synthadoc.core.cache import CACHE_VERSION, CacheManager, make_cache_key
@@ -44,15 +45,11 @@ class IngestResult:
 
 
 _ANALYSIS_PROMPT = (
-    "Analyse the source text below. Return ONLY valid JSON with no markdown fences:\n"
-    '{"entities": [...], "tags": [...], "summary": "One to three sentences describing '
-    'the main topic, key claims, and relevance.", "relevant": true}\n\n'
-    "Keep entities and tags under 10 items each.\n\n"
-)
-
-_ENTITY_PROMPT = (
-    "Extract key entities, concepts, and tags from the text below.\n"
-    "Return ONLY valid JSON: {\"entities\": [...], \"concepts\": [...], \"tags\": [...]}\n"
+    "Extract key entities and tags from the source text below. These will seed a BM25\n"
+    "search to find related wiki pages, so prefer specific named entities (people,\n"
+    "projects, organisations) over generic words.\n"
+    "Return ONLY valid JSON with no markdown fences:\n"
+    '{"entities": [...], "tags": [...]}\n'
     "Keep each list under 10 items.\n\n"
 )
 
@@ -77,9 +74,13 @@ _DECISION_PROMPT = (
     "RULE 3 — CREATE: ONLY if the source covers a subject not in any existing page.\n"
     "-> action='create', new_slug=meaningful_topic_slug (e.g. 'history-of-computing', NOT 'watch' or URL path segments),\n"
     "   page_content=full synthesized Markdown body (# Title + paragraphs with [[slug]] links)\n\n"
+    "DETAIL REQUIREMENT: page_content and update_content must be COMPREHENSIVE. Preserve specific\n"
+    "entities, decisions, numbers, dates, action items, and notable quotes from the source. Use\n"
+    "multiple sections (## headings) when the source covers several topics. Do NOT produce a\n"
+    "one-paragraph stub when the source contains substantially more detail.\n\n"
     'Return: {{"reasoning":"...","action":"...","target":"","new_slug":"","update_content":"","page_content":""}}\n\n'
     "Existing wiki pages (top matches):\n{pages}\n\n"
-    "New source:\n{summary}\n\n"
+    "New source:\n{source}\n\n"
     "Detected entities: {entities}"
 )
 
@@ -183,25 +184,29 @@ class IngestAgent:
             "url": {"fetch_timeout": fetch_timeout},
             "youtube": {"provider": self._provider},
         })
-        self._purpose = self._load_purpose()
 
-    async def _analyse(self, text: str, bust_cache: bool = False) -> dict:
-        """Step 1 — analysis pass: entity extraction + summary. Cached by content hash."""
+    async def _analyse(self, text: str, bust_cache: bool = False,
+                       user_context: str = "") -> dict:
+        """Step 1 — entity/tag extraction for BM25 candidate search. Cached by content hash."""
         text_hash = hashlib.sha256(text.encode()).hexdigest()
-        ck = make_cache_key("analyse-v1", {"text_hash": text_hash}, version=self._cache_version)
+        ctx_hash = hashlib.sha256(user_context.encode()).hexdigest() if user_context else ""
+        ck = make_cache_key(
+            "analyse-v1",
+            {"text_hash": text_hash, "ctx_hash": ctx_hash},
+            version=self._cache_version,
+        )
         if not bust_cache:
             cached = await self._cache.get(ck)
             if cached:
                 return cached
         resp = await self._provider.complete(
-            messages=[Message(role="user", content=f"{_ANALYSIS_PROMPT}{text[:3000]}")],
+            messages=[Message(role="user", content=f"{_ANALYSIS_PROMPT}{text[:40000]}")],
+            system=user_context or None,
             temperature=0.0,
         )
         data = _parse_json_response(resp.text)
         data["entities"] = _coerce_str_list(data.get("entities", []))
         data["tags"] = _coerce_str_list(data.get("tags", []))
-        data.setdefault("summary", text[:200])
-        data.setdefault("relevant", True)
         data["_tokens"] = resp.total_tokens
         await self._cache.set(ck, data)
         return data
@@ -227,6 +232,7 @@ class IngestAgent:
         resp = await self._provider.complete(
             messages=[Message(role="user",
                               content=_OVERVIEW_PROMPT.format(pages=pages_str))],
+            system=load_user_context(self._wiki_root) or None,
             temperature=0.3,
             max_tokens=512,
         )
@@ -237,15 +243,6 @@ class IngestAgent:
             f"# Wiki Overview\n\n{resp.text.strip()}\n"
         )
         (wiki_dir / "overview.md").write_text(content, encoding="utf-8", newline="\n")
-
-    def _load_purpose(self) -> str:
-        """Load wiki/purpose.md for scope filtering. Returns '' if absent."""
-        if self._wiki_root is None:
-            return ""
-        p = self._wiki_root / "wiki" / "purpose.md"
-        if not p.exists():
-            return ""
-        return p.read_text(encoding="utf-8")
 
     def _hash(self, path: str) -> tuple[str, int]:
         data = Path(path).read_bytes()
@@ -369,18 +366,21 @@ class IngestAgent:
             result.tokens_used += vision_resp.total_tokens
             result.input_tokens += vision_resp.input_tokens
             result.output_tokens += vision_resp.output_tokens
-            text = vision_resp.text[:8000]
+            text = vision_resp.text[:40000]
         else:
-            text = extracted.text[:8000]
+            text = extracted.text[:40000]
+
+        # Persona + scope (AGENTS.md + purpose.md) — passed as system prompt so
+        # the LLM personalizes summaries, page writes, and scope decisions.
+        user_context = load_user_context(self._wiki_root)
 
         # Step 1: analysis pass (cached separately from decision)
-        analysis = await self._analyse(text, bust_cache=bust_cache)
+        analysis = await self._analyse(text, bust_cache=bust_cache, user_context=user_context)
         result.tokens_used += analysis.pop("_tokens", 0)
         # input/output split not available for the analyse call (cached via _analyse)
 
         entities = _coerce_str_list(analysis.get("entities", []))
         tags = _coerce_str_list(analysis.get("tags", []))
-        summary = analysis.get("summary", text[:1500])
 
         # Fallback: if LLM entity extraction returned nothing, extract key phrases
         # directly from the source text so BM25 always has meaningful search terms.
@@ -407,28 +407,33 @@ class IngestAgent:
                 pages_ctx.append(f"[{r.slug}]: {snippet}")
         pages_str = "\n".join(pages_ctx) or "none"
 
-        # Pass 3: decision (cached by summary hash + candidate slugs)
+        # Pass 3: decision (cached by source-text hash + candidate slugs + context hash)
         slugs = [r.slug for r in candidates]
-        summary_hash = hashlib.sha256(summary.encode()).hexdigest()
-        ck2 = make_cache_key("make-decision", {"text_hash": summary_hash, "slugs": slugs}, version=self._cache_version)
+        text_hash = hashlib.sha256(text.encode()).hexdigest()
+        ctx_hash = hashlib.sha256(user_context.encode()).hexdigest() if user_context else ""
+        ck2 = make_cache_key(
+            "make-decision",
+            {"text_hash": text_hash, "slugs": slugs, "ctx_hash": ctx_hash},
+            version=self._cache_version,
+        )
         cached2 = None if bust_cache else await self._cache.get(ck2)
         if cached2:
             result.cache_hits += 1
             decisions = cached2
         else:
             decision_prompt = _DECISION_PROMPT
-            if self._purpose:
-                purpose_block = (
-                    f"Wiki scope (from purpose.md):\n{self._purpose}\n\n"
-                    "If the source is clearly outside this scope, respond with action=\"skip\".\n\n"
-                )
-                decision_prompt = purpose_block + _DECISION_PROMPT
+            if user_context:
+                decision_prompt = (
+                    "Per the wiki scope and guidelines in the system message, "
+                    "respond with action=\"skip\" if the source is clearly out of scope.\n\n"
+                ) + _DECISION_PROMPT
             resp2 = await self._provider.complete(
                 messages=[Message(role="user", content=decision_prompt.format(
                     pages=pages_str,
-                    summary=summary,
+                    source=text,
                     entities=entities,
                 ))],
+                system=user_context or None,
                 temperature=0.0,
             )
             result.tokens_used += resp2.total_tokens
@@ -442,7 +447,7 @@ class IngestAgent:
 
         if action == "skip":
             result.skipped = True
-            result.skip_reason = "out of scope (purpose.md)"
+            result.skip_reason = "out of scope"
             return result
         target = decisions.get("target", "")
         new_slug = decisions.get("new_slug") or ""
@@ -463,7 +468,7 @@ class IngestAgent:
             with self._store.page_lock(target):
                 page = self._store.read_page(target)
                 if page:
-                    section = update_content or f"## From {p.name}\n\n{text[:1000]}"
+                    section = update_content or f"## From {p.name}\n\n{text[:30000]}"
                     page.content = page.content.rstrip() + f"\n\n{section}"
                     self._store.write_page(target, page)
                     self._search.invalidate_index()
@@ -488,7 +493,7 @@ class IngestAgent:
                             if extracted.metadata.get("has_summary"):
                                 section = extracted.text
                             else:
-                                section = f"## From {p.name}\n\n{text[:1500]}"
+                                section = f"## From {p.name}\n\n{text[:30000]}"
                             page.content = page.content.rstrip() + f"\n\n{section}"
                             self._store.write_page(slug, page)
                             self._search.invalidate_index()
@@ -499,7 +504,7 @@ class IngestAgent:
                     elif page_content.strip():
                         body = page_content.strip()
                     else:
-                        body = f"# {title}\n\n{text[:4000]}"
+                        body = f"# {title}\n\n{text[:30000]}"
                     new_page = WikiPage(
                         title=title, tags=tags,
                         content=body,
