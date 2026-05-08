@@ -153,6 +153,17 @@ class AnalyseRequest(BaseModel):
         return v
 
 
+class ConsolidateRequest(BaseModel):
+    slug: str
+
+    @field_validator("slug")
+    @classmethod
+    def slug_not_empty(cls, v):
+        if not v.strip():
+            raise ValueError("slug must not be empty")
+        return v
+
+
 def _parse_retry_after(exc: Exception, default: float = 60.0) -> float:
     """Parse 'Please try again in Xm Y.Zs' from a rate-limit error message."""
     m = re.search(r"Please try again in (?:(\d+)m\s*)?(\d+(?:\.\d+)?)s", str(exc))
@@ -349,6 +360,24 @@ def create_app(wiki_root: Path, max_body_bytes: int = _MAX_BODY_BYTES) -> FastAP
             payload["max_results"] = req.max_results
         job_id = await app.state.orch.queue.enqueue("ingest", payload)
         return {"job_id": job_id}
+
+    @app.post("/consolidate")
+    async def consolidate(req: ConsolidateRequest):
+        try:
+            result, cost_usd = await app.state.orch.consolidate(req.slug)
+        except ValueError as e:
+            raise HTTPException(status_code=404, detail=str(e))
+        except RuntimeError as e:
+            raise HTTPException(status_code=502, detail=str(e))
+        return {
+            "slug": result.slug,
+            "skipped": result.skipped,
+            "skip_reason": result.skip_reason,
+            "before_chars": result.before_chars,
+            "after_chars": result.after_chars,
+            "tokens_used": result.tokens_used,
+            "cost_usd": cost_usd,
+        }
 
     @app.post("/jobs/lint")
     async def enqueue_lint(req: LintRequest):

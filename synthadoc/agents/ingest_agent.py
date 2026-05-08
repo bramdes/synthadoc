@@ -500,6 +500,8 @@ class IngestAgent:
             else:
                 actions = []
 
+        source_label, source_date = self._source_provenance(p, source)
+
         explicit_skip = False
         for act in actions:
             if not isinstance(act, dict):
@@ -507,7 +509,8 @@ class IngestAgent:
             if (act.get("action") or "").lower() == "skip":
                 explicit_skip = True
                 continue
-            self._apply_action(act, result, extracted, tags)
+            self._apply_action(act, result, extracted, tags,
+                               source_label, source_date)
 
         if not (result.pages_created or result.pages_updated or result.pages_flagged):
             result.skipped = True
@@ -534,7 +537,8 @@ class IngestAgent:
         return result
 
     def _apply_action(self, act: dict, result: IngestResult,
-                      extracted, tags: list[str]) -> None:
+                      extracted, tags: list[str],
+                      source_label: str, source_date: str) -> None:
         """Apply a single LLM-decided action (flag/update/create/skip)."""
         kind = (act.get("action") or "").lower()
         if kind == "skip" or not kind:
@@ -544,6 +548,10 @@ class IngestAgent:
         new_slug = act.get("new_slug") or ""
         update_content = (act.get("update_content") or "").strip()
         page_content = (act.get("page_content") or "").strip()
+        if update_content:
+            update_content = self._stamp_provenance(update_content, source_label, source_date)
+        if page_content:
+            page_content = self._stamp_provenance(page_content, source_label, source_date)
 
         if kind == "flag":
             if not target or target in LINT_SKIP_SLUGS or not self._store.page_exists(target):
@@ -612,6 +620,30 @@ class IngestAgent:
             return
 
         logger.warning("Unknown action kind: %r", kind)
+
+    @staticmethod
+    def _source_provenance(p, source: str) -> tuple[str, str]:
+        """Return (label, date) for stamping each section with where it came from.
+
+        File sources use the stem (no .md); URL sources use the URL itself.
+        Date is parsed from a leading YYYY-MM-DD in the stem when present
+        (typical for meeting transcripts), else today's UTC date.
+        """
+        if isinstance(source, str) and source.startswith(("http://", "https://")):
+            label = source
+        else:
+            label = getattr(p, "stem", None) or str(p)
+        m = re.match(r"^(\d{4}-\d{2}-\d{2})", str(getattr(p, "stem", "") or ""))
+        date_str = m.group(1) if m else datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        return label, date_str
+
+    @staticmethod
+    def _stamp_provenance(content: str, source_label: str, source_date: str) -> str:
+        """Append a one-line provenance footer unless the LLM already added one."""
+        tail = content[-200:]
+        if "_— Source:" in tail:
+            return content
+        return content.rstrip() + f"\n\n_— Source: {source_label} · {source_date}_"
 
     @staticmethod
     def _title_from_page_content(body: str) -> str:

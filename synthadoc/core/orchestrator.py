@@ -324,6 +324,23 @@ class Orchestrator:
         """Enqueue a lint job. The server worker loop executes it."""
         return await self._queue.enqueue("lint", {"scope": scope, "auto_resolve": auto_resolve})
 
+    async def consolidate(self, slug: str):
+        """Rewrite an accumulated wiki page into a curated form."""
+        from synthadoc.agents.consolidate_agent import ConsolidateAgent
+        _provider = make_provider("ingest", self._cfg)
+        result = await ConsolidateAgent(
+            provider=_provider, store=self._store, search=self._search,
+            wiki_root=self._root,
+        ).consolidate(slug)
+        _model = self._cfg.agents.resolve("ingest").model
+        cost_usd = estimate_cost(
+            _model,
+            result.input_tokens,
+            result.output_tokens,
+            is_local=isinstance(_provider, OllamaProvider),
+        )
+        return result, cost_usd
+
     async def _run_scaffold(self, job_id: str, domain: str) -> None:
         from synthadoc.agents.scaffold_agent import ScaffoldAgent
         try:
