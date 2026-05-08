@@ -33,6 +33,9 @@ class WikiPage:
     created: Optional[str] = None
     orphan: bool = False
     categories: list[str] = field(default_factory=list)
+    # SHA-256 of `content` at the moment ConsolidateAgent last rewrote this page.
+    # Used to short-circuit re-runs when nothing has changed since.
+    consolidated_hash: Optional[str] = None
 
 
 def _sources_to_dicts(sources: list[SourceRef]) -> list[dict]:
@@ -96,6 +99,8 @@ class WikiStorage:
             }
             if page.categories:
                 fm["categories"] = page.categories
+            if page.consolidated_hash:
+                fm["consolidated_hash"] = page.consolidated_hash
             body = page.content
         else:
             fm = frontmatter or {}
@@ -135,6 +140,7 @@ class WikiStorage:
             created=fm.get("created"),
             orphan=bool(fm.get("orphan", False)),
             categories=categories,
+            consolidated_hash=fm.get("consolidated_hash") or None,
         )
 
     def page_exists(self, slug: str) -> bool:

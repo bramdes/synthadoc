@@ -2,6 +2,7 @@
 # Copyright (C) 2026 Paul Chen / axoviq.com
 from __future__ import annotations
 
+import hashlib
 import logging
 from dataclasses import dataclass
 from pathlib import Path
@@ -64,7 +65,7 @@ class ConsolidateAgent:
         self._wiki_root = Path(wiki_root) if wiki_root is not None else None
         self._min_chars = min_chars
 
-    async def consolidate(self, slug: str) -> ConsolidateResult:
+    async def consolidate(self, slug: str, force: bool = False) -> ConsolidateResult:
         if not self._store.page_exists(slug):
             raise ValueError(f"Page not found: {slug}")
 
@@ -73,6 +74,14 @@ class ConsolidateAgent:
             raise ValueError(f"Page not readable: {slug}")
 
         before = page.content
+        before_hash = hashlib.sha256(before.encode("utf-8")).hexdigest()
+        if not force and page.consolidated_hash == before_hash:
+            return ConsolidateResult(
+                slug=slug, skipped=True,
+                skip_reason="no changes since last consolidation",
+                before_chars=len(before), after_chars=len(before),
+            )
+
         if len(before) < self._min_chars:
             return ConsolidateResult(
                 slug=slug, skipped=True,
@@ -115,6 +124,9 @@ class ConsolidateAgent:
 
         with self._store.page_lock(slug):
             page.content = new_body
+            page.consolidated_hash = hashlib.sha256(
+                new_body.encode("utf-8")
+            ).hexdigest()
             self._store.write_page(slug, page)
             self._search.invalidate_index()
 

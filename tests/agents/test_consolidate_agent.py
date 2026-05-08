@@ -101,6 +101,71 @@ async def test_consolidate_rejects_provenance_loss(tmp_wiki, long_page):
 
 
 @pytest.mark.asyncio
+async def test_consolidate_skips_unchanged_page_on_rerun(tmp_wiki, long_page):
+    """Second consolidate on an unchanged page is a no-op via consolidated_hash."""
+    new_body = (
+        "# EGP\n\nCurated body.\n\n## Sec\n\nDetail. " + ("more text. " * 80) + "\n\n"
+        "_— Source: 2026-05-04 13-01-15 EGP Infra Cost · 2026-05-04_\n"
+    )
+    agent, store = _make_agent(tmp_wiki, new_body)
+    store.write_page("egp", long_page)
+
+    first = await agent.consolidate("egp")
+    assert first.skipped is False
+    assert agent._provider.complete.await_count == 1
+
+    second = await agent.consolidate("egp")
+    assert second.skipped is True
+    assert "no changes" in second.skip_reason
+    # LLM not called a second time
+    assert agent._provider.complete.await_count == 1
+
+
+@pytest.mark.asyncio
+async def test_consolidate_force_bypasses_unchanged_skip(tmp_wiki, long_page):
+    """force=True re-runs even when the page hasn't changed since last consolidation."""
+    new_body = (
+        "# EGP\n\nCurated body.\n\n## Sec\n\nDetail. " + ("more text. " * 80) + "\n\n"
+        "_— Source: 2026-05-04 13-01-15 EGP Infra Cost · 2026-05-04_\n"
+    )
+    agent, store = _make_agent(tmp_wiki, new_body)
+    store.write_page("egp", long_page)
+
+    await agent.consolidate("egp")
+    assert agent._provider.complete.await_count == 1
+
+    forced = await agent.consolidate("egp", force=True)
+    assert forced.skipped is False
+    assert agent._provider.complete.await_count == 2
+
+
+@pytest.mark.asyncio
+async def test_consolidate_reruns_after_content_change(tmp_wiki, long_page):
+    """Appending new content (e.g. by ingest) breaks the hash and consolidate runs again."""
+    new_body = (
+        "# EGP\n\nCurated body.\n\n## Sec\n\nDetail. " + ("more text. " * 80) + "\n\n"
+        "_— Source: 2026-05-04 13-01-15 EGP Infra Cost · 2026-05-04_\n"
+    )
+    agent, store = _make_agent(tmp_wiki, new_body)
+    store.write_page("egp", long_page)
+
+    await agent.consolidate("egp")
+    assert agent._provider.complete.await_count == 1
+
+    # Simulate ingest appending a fresh section
+    page = store.read_page("egp")
+    page.content = page.content.rstrip() + (
+        "\n\n## New Topic\n\nFreshly ingested. " + ("more. " * 80) + "\n\n"
+        "_— Source: 2026-05-08 09-00-00 New Sync · 2026-05-08_\n"
+    )
+    store.write_page("egp", page)
+
+    again = await agent.consolidate("egp")
+    assert again.skipped is False
+    assert agent._provider.complete.await_count == 2
+
+
+@pytest.mark.asyncio
 async def test_consolidate_strips_code_fences(tmp_wiki, long_page):
     # LLMs sometimes wrap output in ```markdown fences; agent must strip them
     fenced = (

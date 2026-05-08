@@ -14,16 +14,22 @@ from synthadoc.cli._http import post
 def consolidate_cmd(
     slug: str = typer.Argument(..., help="Wiki page slug to consolidate"),
     wiki: Optional[str] = typer.Option(None, "--wiki", "-w"),
+    force: bool = typer.Option(False, "--force",
+        help="Re-consolidate even if the page hasn't changed since last run."),
 ):
     """Rewrite an accumulated wiki page into a curated, deduplicated form.
 
     Use this when a project/person/topic page has grown by repeated ingest
     appends and needs reorganising. Provenance footers (`_— Source: …_`) and
     [[wikilinks]] are preserved verbatim. Requires `synthadoc serve`.
+
+    Re-running on an unchanged page is a no-op — the page's frontmatter records
+    the content hash at last consolidation, so we skip when the body matches.
+    Pass --force to override.
     """
     from synthadoc.cli._wiki import resolve_wiki
     wiki = resolve_wiki(wiki)
-    result = post(wiki, "/consolidate", {"slug": slug})
+    result = post(wiki, "/consolidate", {"slug": slug, "force": force})
     if result.get("skipped"):
         typer.echo(f"Skipped {result['slug']}: {result['skip_reason']}")
         raise typer.Exit(0)
