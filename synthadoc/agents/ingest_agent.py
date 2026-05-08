@@ -54,31 +54,38 @@ _ANALYSIS_PROMPT = (
 )
 
 _DECISION_PROMPT = (
-    "You maintain a knowledge wiki. Decide how to handle a new source document.\n"
-    "Return ONLY valid JSON - no markdown fences, no explanation.\n\n"
-    "First write a 'reasoning' field explaining your decision, then set 'action'.\n\n"
-    "WIKILINKS: Whenever you write page content (update_content or page_content), cross-reference\n"
-    "related topics using [[slug]] notation where slug matches a page listed below.\n"
-    "Example: 'Turing worked at [[bletchley-park]] on the [[enigma]] cipher.'\n"
-    "Only link to pages that actually exist in the wiki (slugs shown below).\n\n"
-    "Decision rules (apply in this order):\n\n"
-    "RULE 1 — FLAG: If the new source DISPUTES or ARGUES AGAINST a factual claim in an existing page,\n"
-    "use action='flag'. This includes academic debates, alternative historical interpretations,\n"
-    "or sources that explicitly say an existing claim is wrong or a myth.\n"
-    "Example: page says 'A-0 was the first compiler' + source says 'A-0 was a loader, not a compiler'\n"
-    "-> action='flag', target=the slug of the page whose claim is disputed\n\n"
-    "RULE 2 — UPDATE: If the source adds new information about a subject ALREADY covered by an existing page,\n"
-    "and there is no factual dispute, use action='update'.\n"
-    "-> action='update', target=slug of page to extend,\n"
-    "   update_content=new ## section(s) to append (use [[slug]] links to related pages)\n\n"
-    "RULE 3 — CREATE: ONLY if the source covers a subject not in any existing page.\n"
-    "-> action='create', new_slug=meaningful_topic_slug (e.g. 'history-of-computing', NOT 'watch' or URL path segments),\n"
-    "   page_content=full synthesized Markdown body (# Title + paragraphs with [[slug]] links)\n\n"
-    "DETAIL REQUIREMENT: page_content and update_content must be COMPREHENSIVE. Preserve specific\n"
-    "entities, decisions, numbers, dates, action items, and notable quotes from the source. Use\n"
-    "multiple sections (## headings) when the source covers several topics. Do NOT produce a\n"
-    "one-paragraph stub when the source contains substantially more detail.\n\n"
-    'Return: {{"reasoning":"...","action":"...","target":"","new_slug":"","update_content":"","page_content":""}}\n\n'
+    "You maintain a knowledge wiki. A new source document has arrived. Identify EVERY\n"
+    "distinct subject discussed and produce one action per subject. The wiki is keyed\n"
+    "by long-lived topics, so a single meeting transcript typically fans out into\n"
+    "multiple actions targeting different project / person / issue pages.\n\n"
+    "Return ONLY valid JSON — no markdown fences, no explanation outside the JSON.\n\n"
+    "SLUG RULES (CRITICAL):\n"
+    "- A slug names a long-lived subject: a project/program, a person/stakeholder,\n"
+    "  or a recurring issue/topic. Examples: 'egp', 'dong-tao', 'api-key-governance'.\n"
+    "- NEVER use a meeting filename, date, time, or 'meeting-with-X' as a slug.\n"
+    "- Slugs must NOT begin with a date pattern (YYYY-MM-DD) — those are rejected.\n"
+    "- Slugs must NOT include 'meeting', 'sync', 'standup', 'review-with-' as the\n"
+    "  primary topic — those describe the event, not the subject.\n\n"
+    "WIKILINKS: When writing update_content or page_content, cross-reference related\n"
+    "topics using [[slug]] notation. Only link to slugs that exist in the wiki list\n"
+    "below or that you are creating in this same response.\n\n"
+    "Per-action rules:\n\n"
+    "FLAG — if the source DISPUTES a factual claim in an existing page:\n"
+    "  {{\"action\":\"flag\", \"target\":\"existing-slug\"}}\n\n"
+    "UPDATE — if the source adds info about a subject ALREADY covered by an existing page:\n"
+    "  {{\"action\":\"update\", \"target\":\"existing-slug\",\n"
+    "    \"update_content\":\"## <descriptive section heading> (YYYY-MM-DD)\\n\\n<detailed body>\"}}\n\n"
+    "CREATE — only if the subject is NOT in any existing page:\n"
+    "  {{\"action\":\"create\", \"new_slug\":\"topic-slug\",\n"
+    "    \"page_content\":\"# <Title>\\n\\n<full body with [[slug]] links>\"}}\n\n"
+    "SKIP — if a subject is out of scope per the wiki guidelines, omit it (do not emit\n"
+    "an action). If NO subject is in scope, return actions: [] with reasoning.\n\n"
+    "DETAIL REQUIREMENT: each update_content / page_content must be COMPREHENSIVE for\n"
+    "its subject — preserve specific entities, decisions, numbers, dates, action items,\n"
+    "and notable quotes RELATED TO THAT SUBJECT. Do not produce a one-paragraph stub\n"
+    "when the source contains substantially more detail about that subject.\n\n"
+    "Return shape:\n"
+    '  {{"reasoning":"...","actions":[ {{...}}, {{...}} ]}}\n\n'
     "Existing wiki pages (top matches):\n{pages}\n\n"
     "New source:\n{source}\n\n"
     "Detected entities: {entities}"
@@ -104,6 +111,19 @@ _SLUG_BLACKLIST = frozenset({
     # URL path segments that are never meaningful topic names
     "watch", "embed", "video", "index", "page", "post", "article", "content",
 })
+
+# Reject slugs that look like meeting events rather than long-lived subjects:
+# date-prefixed (2026-05-04-...) or built around event nouns (meeting, sync, etc.).
+_MEETING_SLUG_RE = re.compile(
+    r"^\d{4}-\d{2}-\d{2}|"           # date prefix: 2026-05-04...
+    r"(^|-)(meeting|sync|standup|review-with|catchup|catch-up|"
+    r"check-in|checkin|1-?on-?1|one-on-one)(-|$)",
+    re.IGNORECASE,
+)
+
+
+def _is_meeting_slug(slug: str) -> bool:
+    return bool(_MEETING_SLUG_RE.search(slug))
 
 
 def _coerce_str_list(lst: object) -> list[str]:
@@ -370,6 +390,35 @@ class IngestAgent:
         else:
             text = extracted.text[:40000]
 
+        if not text or not text.strip():
+            logger.warning("Skipping ingest for %s — no extractable text", source)
+            result.skipped = True
+            result.skip_reason = "no extractable text"
+            return result
+
+        # Pre-summarised sources (e.g. YouTube) bypass analysis/decision: the
+        # skill already produced a synthesized body; write it directly.
+        if extracted.metadata.get("has_summary"):
+            self._write_has_summary_page(extracted, [], result)
+            if result.pages_created or result.pages_updated:
+                await self._update_overview()
+            else:
+                result.skipped = True
+                result.skip_reason = result.skip_reason or "has_summary source had no usable slug"
+            self._log.log_ingest(source=p.name,
+                                 pages_created=result.pages_created,
+                                 pages_updated=result.pages_updated,
+                                 pages_flagged=result.pages_flagged,
+                                 tokens=result.tokens_used,
+                                 cost_usd=result.cost_usd,
+                                 cache_hits=result.cache_hits)
+            primary = (result.pages_created + result.pages_updated
+                       + result.pages_flagged or [p.stem])[0]
+            await self._audit.record_ingest(src_hash, src_size, source,
+                                            primary,
+                                            result.tokens_used, result.cost_usd)
+            return result
+
         # Persona + scope (AGENTS.md + purpose.md) — passed as system prompt so
         # the LLM personalizes summaries, page writes, and scope decisions.
         user_context = load_user_context(self._wiki_root)
@@ -442,80 +491,30 @@ class IngestAgent:
             decisions = _parse_json_response(resp2.text)
             await self._cache.set(ck2, decisions)
 
-        # Pass 4: writes based on action
-        action = decisions.get("action", "create")
-
-        if action == "skip":
-            result.skipped = True
-            result.skip_reason = "out of scope"
-            return result
-        target = decisions.get("target", "")
-        new_slug = decisions.get("new_slug") or ""
-        update_content = decisions.get("update_content", "")
-        page_content = decisions.get("page_content", "")
-        title = p.stem.replace("-", " ").replace("_", " ").title()
-
-        if action == "flag" and target and target not in LINT_SKIP_SLUGS and self._store.page_exists(target):
-            with self._store.page_lock(target):
-                page = self._store.read_page(target)
-                if page:
-                    page.status = "contradicted"
-                    self._store.write_page(target, page)
-                    self._search.invalidate_index()
-            result.pages_flagged.append(target)
-
-        elif action == "update" and target and self._store.page_exists(target):
-            with self._store.page_lock(target):
-                page = self._store.read_page(target)
-                if page:
-                    section = update_content or f"## From {p.name}\n\n{text[:30000]}"
-                    page.content = page.content.rstrip() + f"\n\n{section}"
-                    self._store.write_page(target, page)
-                    self._search.invalidate_index()
-            result.pages_updated.append(target)
-
-        else:  # "create" or fallback
-            # Don't create a page if there's no content to put in it
-            if not text or not text.strip():
-                logger.warning("Skipping page creation for %s — no text extracted", source)
-                result.skip_reason = "no extractable text"
-                result.skipped = True
+        # Pass 4: process each action. Backward-compat: legacy decisions had a
+        # single top-level action; wrap them into a one-element list.
+        actions = decisions.get("actions")
+        if not isinstance(actions, list):
+            if decisions.get("action"):
+                actions = [decisions]
             else:
-                # Reject slugs that look like wiki syntax artifacts rather than real topics
-                raw_slug = _slugify(new_slug or title)
-                slug = raw_slug if raw_slug not in _SLUG_BLACKLIST else _slugify(title)
+                actions = []
 
-                if self._store.page_exists(slug):
-                    # Slug already exists — never overwrite; append as update instead
-                    with self._store.page_lock(slug):
-                        page = self._store.read_page(slug)
-                        if page:
-                            if extracted.metadata.get("has_summary"):
-                                section = extracted.text
-                            else:
-                                section = f"## From {p.name}\n\n{text[:30000]}"
-                            page.content = page.content.rstrip() + f"\n\n{section}"
-                            self._store.write_page(slug, page)
-                            self._search.invalidate_index()
-                    result.pages_updated.append(slug)
-                else:
-                    if extracted.metadata.get("has_summary"):
-                        body = extracted.text
-                    elif page_content.strip():
-                        body = page_content.strip()
-                    else:
-                        body = f"# {title}\n\n{text[:30000]}"
-                    new_page = WikiPage(
-                        title=title, tags=tags,
-                        content=body,
-                        status="active", confidence="medium", sources=[],
-                        created=datetime.now(timezone.utc).strftime("%Y-%m-%d"),
-                    )
-                    with self._store.page_lock(slug):
-                        self._store.write_page(slug, new_page)
-                        self._search.invalidate_index()
-                    result.pages_created.append(slug)
-                    self._store.append_to_index(slug, new_page.title)
+        explicit_skip = False
+        for act in actions:
+            if not isinstance(act, dict):
+                continue
+            if (act.get("action") or "").lower() == "skip":
+                explicit_skip = True
+                continue
+            self._apply_action(act, result, extracted, tags)
+
+        if not (result.pages_created or result.pages_updated or result.pages_flagged):
+            result.skipped = True
+            if explicit_skip:
+                result.skip_reason = "out of scope"
+            else:
+                result.skip_reason = result.skip_reason or "no synthesizable content"
 
         if result.pages_created or result.pages_updated:
             await self._update_overview()
@@ -527,8 +526,132 @@ class IngestAgent:
                              tokens=result.tokens_used,
                              cost_usd=result.cost_usd,
                              cache_hits=result.cache_hits)
+        primary = (result.pages_created + result.pages_updated
+                   + result.pages_flagged or [p.stem])[0]
         await self._audit.record_ingest(src_hash, src_size, source,
-                                        (result.pages_created + result.pages_updated
-                                         + result.pages_flagged or [title])[0],
+                                        primary,
                                         result.tokens_used, result.cost_usd)
         return result
+
+    def _apply_action(self, act: dict, result: IngestResult,
+                      extracted, tags: list[str]) -> None:
+        """Apply a single LLM-decided action (flag/update/create/skip)."""
+        kind = (act.get("action") or "").lower()
+        if kind == "skip" or not kind:
+            return
+
+        target = act.get("target") or ""
+        new_slug = act.get("new_slug") or ""
+        update_content = (act.get("update_content") or "").strip()
+        page_content = (act.get("page_content") or "").strip()
+
+        if kind == "flag":
+            if not target or target in LINT_SKIP_SLUGS or not self._store.page_exists(target):
+                logger.warning("Skipping flag — target missing or invalid: %r", target)
+                return
+            with self._store.page_lock(target):
+                page = self._store.read_page(target)
+                if page:
+                    page.status = "contradicted"
+                    self._store.write_page(target, page)
+                    self._search.invalidate_index()
+            result.pages_flagged.append(target)
+            return
+
+        if kind == "update":
+            if not target or not self._store.page_exists(target):
+                logger.warning("Skipping update — target missing: %r", target)
+                return
+            if not update_content:
+                logger.warning("Skipping update for %s — empty update_content", target)
+                return
+            with self._store.page_lock(target):
+                page = self._store.read_page(target)
+                if page:
+                    page.content = page.content.rstrip() + f"\n\n{update_content}"
+                    self._store.write_page(target, page)
+                    self._search.invalidate_index()
+            result.pages_updated.append(target)
+            return
+
+        if kind == "create":
+            if not new_slug:
+                logger.warning("Skipping create — no new_slug provided")
+                return
+            if not page_content:
+                logger.warning("Skipping create for slug %r — empty page_content", new_slug)
+                return
+            slug = _slugify(new_slug)
+            if not slug or slug in _SLUG_BLACKLIST or _is_meeting_slug(slug):
+                logger.warning("Skipping create — slug rejected: %r → %r", new_slug, slug)
+                return
+
+            if self._store.page_exists(slug):
+                # Slug already exists — append page_content as a new section instead of overwriting
+                with self._store.page_lock(slug):
+                    page = self._store.read_page(slug)
+                    if page:
+                        page.content = page.content.rstrip() + f"\n\n{page_content}"
+                        self._store.write_page(slug, page)
+                        self._search.invalidate_index()
+                result.pages_updated.append(slug)
+                return
+
+            page_title = self._title_from_page_content(page_content) or slug.replace("-", " ").title()
+            new_page = WikiPage(
+                title=page_title, tags=tags,
+                content=page_content,
+                status="active", confidence="medium", sources=[],
+                created=datetime.now(timezone.utc).strftime("%Y-%m-%d"),
+            )
+            with self._store.page_lock(slug):
+                self._store.write_page(slug, new_page)
+                self._search.invalidate_index()
+            result.pages_created.append(slug)
+            self._store.append_to_index(slug, new_page.title)
+            return
+
+        logger.warning("Unknown action kind: %r", kind)
+
+    @staticmethod
+    def _title_from_page_content(body: str) -> str:
+        """Pull a title from the first '# Title' line of LLM-supplied page content."""
+        for line in body.splitlines():
+            stripped = line.strip()
+            if stripped.startswith("# "):
+                return stripped.lstrip("#").strip()
+            if stripped:
+                break
+        return ""
+
+    def _write_has_summary_page(self, extracted, tags: list[str],
+                                result: IngestResult) -> None:
+        """Write a YouTube-style pre-summarised body directly to a slug derived
+        from the source's video_id/url, bypassing the LLM decision flow."""
+        meta = extracted.metadata or {}
+        slug_seed = meta.get("video_id") or meta.get("url") or extracted.source_path
+        slug = _slugify(str(slug_seed))
+        if not slug or _is_meeting_slug(slug) or slug in _SLUG_BLACKLIST:
+            logger.warning("has_summary source had no usable slug: %r", slug_seed)
+            return
+        body = extracted.text
+        page_title = self._title_from_page_content(body) or slug.replace("-", " ").title()
+        if self._store.page_exists(slug):
+            with self._store.page_lock(slug):
+                page = self._store.read_page(slug)
+                if page:
+                    page.content = page.content.rstrip() + f"\n\n{body}"
+                    self._store.write_page(slug, page)
+                    self._search.invalidate_index()
+            result.pages_updated.append(slug)
+            return
+        new_page = WikiPage(
+            title=page_title, tags=tags, content=body,
+            status="active", confidence="medium", sources=[],
+            created=datetime.now(timezone.utc).strftime("%Y-%m-%d"),
+        )
+        with self._store.page_lock(slug):
+            self._store.write_page(slug, new_page)
+            self._search.invalidate_index()
+        result.pages_created.append(slug)
+        self._store.append_to_index(slug, new_page.title)

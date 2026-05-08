@@ -46,7 +46,7 @@ def mock_provider():
         input_tokens=100, output_tokens=50,
     )
     _decision = CompletionResponse(
-        text='{"action":"create","target":"","new_slug":"ai-safety","update_content":""}',
+        text='{"action":"create","target":"","new_slug":"ai-safety","update_content":"","page_content":"# AI Safety\\n\\nNotes on AI safety."}',
         input_tokens=100, output_tokens=50,
     )
     # side_effect as iterator: entity, decision, entity, decision, ...
@@ -146,7 +146,7 @@ async def test_force_busts_cache(tmp_wiki, mock_provider):
     _entity = CompletionResponse(text='{"entities":[],"concepts":[],"tags":[]}',
                                  input_tokens=100, output_tokens=50)
     _decision = CompletionResponse(
-        text='{"action":"create","target":"","new_slug":"force-bust-test","update_content":""}',
+        text='{"action":"create","target":"","new_slug":"force-bust-test","update_content":"","page_content":"# Force Bust Test\\n\\nBody."}',
         input_tokens=100, output_tokens=50)
     mock_provider.complete.side_effect = itertools.cycle([_entity, _decision])
 
@@ -435,7 +435,7 @@ async def test_overview_md_created_after_ingest(tmp_wiki):
         text='{"entities":["AI"],"tags":["ml"],"summary":"AI safety research.","relevant":true}',
         input_tokens=50, output_tokens=20)
     decision_resp = CompletionResponse(
-        text='{"reasoning":"New topic","action":"create","target":"","new_slug":"ai-safety","update_content":""}',
+        text='{"reasoning":"New topic","action":"create","target":"","new_slug":"ai-safety","update_content":"","page_content":"# AI Safety\\n\\nBody."}',
         input_tokens=50, output_tokens=20)
     overview_resp = CompletionResponse(
         text="This wiki covers AI safety research.\n\nKey themes include alignment.",
@@ -735,7 +735,7 @@ async def test_ingest_vision_path_extracts_text_from_image(tmp_wiki):
         text='{"entities":["CPU","architecture"],"tags":["hardware"],"summary":"CPU diagram.","relevant":true}',
         input_tokens=40, output_tokens=20)
     decision_resp = CompletionResponse(
-        text='{"action":"create","target":"","new_slug":"cpu-architecture","update_content":""}',
+        text='{"action":"create","target":"","new_slug":"cpu-architecture","update_content":"","page_content":"# CPU Architecture\\n\\nDiagram and notes."}',
         input_tokens=50, output_tokens=25)
     provider.complete = AsyncMock(side_effect=itertools.cycle(
         [vision_resp, entity_resp, decision_resp]))
