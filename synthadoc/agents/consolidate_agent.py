@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import hashlib
 import logging
+import re
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
@@ -40,6 +42,12 @@ _CONSOLIDATE_PROMPT = (
 )
 
 
+_WIKILINK_RE = re.compile(r"\[\[([^\]\|#]+)(?:[\|#][^\]]*)?\]\]")
+_SOURCE_LINE_RE = re.compile(
+    r"_—\s*Source:\s*(?P<label>.+?)\s*·\s*(?P<date>\d{4}-\d{2}-\d{2})\s*_"
+)
+
+
 @dataclass
 class ConsolidateResult:
     slug: str
@@ -50,6 +58,8 @@ class ConsolidateResult:
     tokens_used: int = 0
     input_tokens: int = 0
     output_tokens: int = 0
+    backup_path: Optional[str] = None
+    proposed_body: Optional[str] = None  # populated only on dry_run
 
 
 class ConsolidateAgent:
@@ -58,14 +68,17 @@ class ConsolidateAgent:
     def __init__(self, provider: LLMProvider, store: WikiStorage,
                  search: HybridSearch,
                  wiki_root: Optional[Path] = None,
-                 min_chars: int = 2000) -> None:
+                 min_chars: int = 2000,
+                 length_floor: float = 0.5) -> None:
         self._provider = provider
         self._store = store
         self._search = search
         self._wiki_root = Path(wiki_root) if wiki_root is not None else None
         self._min_chars = min_chars
+        self._length_floor = length_floor
 
-    async def consolidate(self, slug: str, force: bool = False) -> ConsolidateResult:
+    async def consolidate(self, slug: str, force: bool = False,
+                          dry_run: bool = False) -> ConsolidateResult:
         if not self._store.page_exists(slug):
             raise ValueError(f"Page not found: {slug}")
 
@@ -99,15 +112,7 @@ class ConsolidateAgent:
             temperature=0.0,
         )
 
-        new_body = resp.text.strip()
-        # Defend against the LLM wrapping the result in code fences anyway.
-        if new_body.startswith("```"):
-            lines = new_body.splitlines()
-            if lines[0].startswith("```"):
-                lines = lines[1:]
-            if lines and lines[-1].strip() == "```":
-                lines = lines[:-1]
-            new_body = "\n".join(lines).strip()
+        new_body = self._strip_code_fences(resp.text.strip())
 
         if not new_body or len(new_body) < 200:
             raise RuntimeError(
@@ -115,12 +120,20 @@ class ConsolidateAgent:
                 f"({len(new_body)} chars)"
             )
 
-        # Provenance guard: refuse to write if every source footer disappeared.
-        if "_— Source:" in before and "_— Source:" not in new_body:
-            raise RuntimeError(
-                f"Consolidate dropped all provenance footers for {slug}; "
-                "refusing to write."
+        self._verify_preservation(slug, before, new_body)
+
+        if dry_run:
+            return ConsolidateResult(
+                slug=slug,
+                before_chars=len(before),
+                after_chars=len(new_body),
+                tokens_used=resp.total_tokens,
+                input_tokens=resp.input_tokens,
+                output_tokens=resp.output_tokens,
+                proposed_body=new_body,
             )
+
+        backup_path = self._write_backup(slug, before)
 
         with self._store.page_lock(slug):
             page.content = new_body
@@ -131,8 +144,8 @@ class ConsolidateAgent:
             self._search.invalidate_index()
 
         logger.info(
-            "consolidated %s: %d → %d chars (%d tokens)",
-            slug, len(before), len(new_body), resp.total_tokens,
+            "consolidated %s: %d → %d chars (%d tokens, backup: %s)",
+            slug, len(before), len(new_body), resp.total_tokens, backup_path,
         )
         return ConsolidateResult(
             slug=slug,
@@ -141,4 +154,58 @@ class ConsolidateAgent:
             tokens_used=resp.total_tokens,
             input_tokens=resp.input_tokens,
             output_tokens=resp.output_tokens,
+            backup_path=str(backup_path) if backup_path else None,
         )
+
+    @staticmethod
+    def _strip_code_fences(text: str) -> str:
+        """LLMs occasionally wrap output in ```markdown ... ``` fences; strip."""
+        if not text.startswith("```"):
+            return text
+        lines = text.splitlines()
+        if lines and lines[0].startswith("```"):
+            lines = lines[1:]
+        if lines and lines[-1].strip() == "```":
+            lines = lines[:-1]
+        return "\n".join(lines).strip()
+
+    def _verify_preservation(self, slug: str, before: str, after: str) -> None:
+        """Reject the rewrite if it dropped wikilinks, sources, or shrank too much."""
+        old_links = set(_WIKILINK_RE.findall(before))
+        new_links = set(_WIKILINK_RE.findall(after))
+        missing_links = old_links - new_links
+        if missing_links:
+            raise RuntimeError(
+                f"Consolidate dropped wikilinks for {slug}: "
+                f"{sorted(missing_links)}"
+            )
+
+        old_sources = {(m.group("label"), m.group("date"))
+                       for m in _SOURCE_LINE_RE.finditer(before)}
+        new_sources = {(m.group("label"), m.group("date"))
+                       for m in _SOURCE_LINE_RE.finditer(after)}
+        missing_sources = old_sources - new_sources
+        if missing_sources:
+            raise RuntimeError(
+                f"Consolidate dropped provenance source(s) for {slug}: "
+                f"{sorted(missing_sources)}"
+            )
+
+        if len(before) > 0 and len(after) < len(before) * self._length_floor:
+            raise RuntimeError(
+                f"Consolidate over-shrank {slug}: "
+                f"{len(after)} chars < {len(before)} × {self._length_floor:.2f} floor "
+                f"({int(len(before) * self._length_floor)} min). The LLM likely "
+                f"summarised instead of curating."
+            )
+
+    def _write_backup(self, slug: str, before: str) -> Optional[Path]:
+        """Save the pre-consolidation body so a bad rewrite can be rolled back."""
+        if self._wiki_root is None:
+            return None
+        backup_dir = self._wiki_root / ".synthadoc" / "consolidate-backups"
+        backup_dir.mkdir(parents=True, exist_ok=True)
+        ts = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+        path = backup_dir / f"{slug}-{ts}.md"
+        path.write_text(before, encoding="utf-8")
+        return path

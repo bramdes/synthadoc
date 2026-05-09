@@ -324,14 +324,15 @@ class Orchestrator:
         """Enqueue a lint job. The server worker loop executes it."""
         return await self._queue.enqueue("lint", {"scope": scope, "auto_resolve": auto_resolve})
 
-    async def consolidate(self, slug: str, force: bool = False):
+    async def consolidate(self, slug: str, force: bool = False,
+                          dry_run: bool = False):
         """Rewrite an accumulated wiki page into a curated form."""
         from synthadoc.agents.consolidate_agent import ConsolidateAgent
         _provider = make_provider("ingest", self._cfg)
         result = await ConsolidateAgent(
             provider=_provider, store=self._store, search=self._search,
             wiki_root=self._root,
-        ).consolidate(slug, force=force)
+        ).consolidate(slug, force=force, dry_run=dry_run)
         _model = self._cfg.agents.resolve("ingest").model
         cost_usd = estimate_cost(
             _model,

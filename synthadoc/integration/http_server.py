@@ -156,6 +156,7 @@ class AnalyseRequest(BaseModel):
 class ConsolidateRequest(BaseModel):
     slug: str
     force: bool = False
+    dry_run: bool = False
 
     @field_validator("slug")
     @classmethod
@@ -365,7 +366,9 @@ def create_app(wiki_root: Path, max_body_bytes: int = _MAX_BODY_BYTES) -> FastAP
     @app.post("/consolidate")
     async def consolidate(req: ConsolidateRequest):
         try:
-            result, cost_usd = await app.state.orch.consolidate(req.slug, force=req.force)
+            result, cost_usd = await app.state.orch.consolidate(
+                req.slug, force=req.force, dry_run=req.dry_run,
+            )
         except ValueError as e:
             raise HTTPException(status_code=404, detail=str(e))
         except RuntimeError as e:
@@ -378,6 +381,8 @@ def create_app(wiki_root: Path, max_body_bytes: int = _MAX_BODY_BYTES) -> FastAP
             "after_chars": result.after_chars,
             "tokens_used": result.tokens_used,
             "cost_usd": cost_usd,
+            "backup_path": result.backup_path,
+            "proposed_body": result.proposed_body,
         }
 
     @app.post("/jobs/lint")
