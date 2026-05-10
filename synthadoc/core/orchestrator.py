@@ -345,8 +345,7 @@ class Orchestrator:
     async def _run_scaffold(self, job_id: str, domain: str) -> None:
         from synthadoc.agents.scaffold_agent import ScaffoldAgent
         try:
-            wiki_dir = self._root / "wiki"
-            protected_slugs = [p.stem for p in wiki_dir.glob("*.md")]
+            protected_slugs = self._store.list_pages()
             result = await ScaffoldAgent(
                 provider=make_provider("ingest", self._cfg)
             ).scaffold(domain=domain, protected_slugs=protected_slugs or None)

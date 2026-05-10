@@ -36,7 +36,7 @@ def _index_suggestion(slug: str, fm: dict) -> str:
     return f"- [[{slug}]] — {hint}"
 
 def _sync_orphan_frontmatter(
-    wiki_dir: Path,
+    page_paths: dict[str, Path],
     page_texts: dict[str, str],
     orphan_set: set[str],
 ) -> None:
@@ -50,8 +50,9 @@ def _sync_orphan_frontmatter(
         desired = slug in orphan_set
         if fm.get("orphan", False) == desired:
             continue  # already correct — skip to avoid unnecessary disk write
-        # Rewrite only the orphan key in the frontmatter block
-        path = wiki_dir / f"{slug}.md"
+        path = page_paths.get(slug)
+        if path is None:
+            continue
         m = _FRONTMATTER_RE.match(text)
         if not m:
             continue
@@ -103,9 +104,14 @@ def lint_report(
         from synthadoc import errors as E
         E.cli_error(E.WIKI_NOT_FOUND, f"Wiki directory not found: {wiki_dir}")
 
-    pages = list(wiki_dir.glob("*.md"))
-
-    page_texts: dict[str, str] = {p.stem: p.read_text(encoding="utf-8") for p in pages}
+    # Walk the wiki root and one level of subfolders (people/, projects/, …),
+    # skipping hidden directories like .synthadoc.
+    pages = [
+        p for p in wiki_dir.rglob("*.md")
+        if not any(part.startswith(".") for part in p.relative_to(wiki_dir).parts)
+    ]
+    page_paths: dict[str, Path] = {p.stem: p for p in pages}
+    page_texts: dict[str, str] = {stem: p.read_text(encoding="utf-8") for stem, p in page_paths.items()}
 
     # --- Contradictions ---
     contradicted = [
@@ -126,15 +132,16 @@ def lint_report(
     has_issues = contradicted or orphans
     if not has_issues:
         # Still sync frontmatter to clear stale orphan: true flags from previous runs.
-        _sync_orphan_frontmatter(wiki_dir, page_texts, set())
+        _sync_orphan_frontmatter(page_paths, page_texts, set())
         typer.echo("All clear — no contradictions or orphan pages found.")
         return
 
     if contradicted:
         typer.echo(f"\nContradicted pages ({len(contradicted)}) - need review:\n")
         for slug in contradicted:
+            rel = page_paths[slug].relative_to(wiki_dir.parent).as_posix()
             typer.echo(f"  {slug}")
-            typer.echo(f"    -> Open wiki/{slug}.md, resolve the conflict, then set status: active")
+            typer.echo(f"    -> Open {rel}, resolve the conflict, then set status: active")
             typer.echo(f"    -> Or re-run: synthadoc lint -w {wiki} --auto-resolve")
 
     if orphans:
@@ -148,7 +155,7 @@ def lint_report(
 
     # Sync orphan: true/false frontmatter so the Obsidian dashboard Dataview
     # query (WHERE orphan = true) reflects the same result as this report.
-    _sync_orphan_frontmatter(wiki_dir, page_texts, set(orphans))
+    _sync_orphan_frontmatter(page_paths, page_texts, set(orphans))
 
     typer.echo(
         f"\n{len(contradicted)} contradiction(s), {len(orphans)} orphan(s) found."

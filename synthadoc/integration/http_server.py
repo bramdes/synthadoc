@@ -397,8 +397,10 @@ def create_app(wiki_root: Path, max_body_bytes: int = _MAX_BODY_BYTES) -> FastAP
         import yaml as _yaml
         from synthadoc.agents.lint_agent import find_orphan_slugs, LINT_SKIP_SLUGS
         wiki_dir = wiki_root / "wiki"
-        pages = list(wiki_dir.glob("*.md"))
-
+        pages = [
+            p for p in wiki_dir.rglob("*.md")
+            if not any(part.startswith(".") for part in p.relative_to(wiki_dir).parts)
+        ]
         page_texts: dict[str, str] = {p.stem: p.read_text(encoding="utf-8") for p in pages}
 
         contradicted = [

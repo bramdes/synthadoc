@@ -51,11 +51,13 @@ def _protected_slugs(wiki_dir: Path) -> list[str]:
     index_path = wiki_dir / "wiki" / "index.md"
     if not index_path.exists():
         return []
+    from synthadoc.storage.wiki import WikiStorage
+    store = WikiStorage(wiki_dir / "wiki")
     text = index_path.read_text(encoding="utf-8")
     slugs = []
     for m in _WIKILINK_RE.finditer(text):
         slug = m.group(1).strip()
-        if (wiki_dir / "wiki" / f"{slug}.md").exists():
+        if store.page_exists(slug):
             slugs.append(slug)
     return slugs
 

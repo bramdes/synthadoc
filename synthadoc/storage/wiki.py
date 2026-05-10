@@ -36,6 +36,9 @@ class WikiPage:
     # SHA-256 of `content` at the moment ConsolidateAgent last rewrote this page.
     # Used to short-circuit re-runs when nothing has changed since.
     consolidated_hash: Optional[str] = None
+    # Subfolder under wiki root where this page lives (e.g. "people", "projects").
+    # None means the page is at the wiki root. Runtime-only — not serialized.
+    folder: Optional[str] = None
 
 
 def _sources_to_dicts(sources: list[SourceRef]) -> list[dict]:
@@ -75,8 +78,43 @@ class WikiStorage:
                 f"Path {resolved} is outside wiki root {root_resolved}"
             )
 
-    def _page_path(self, slug: str) -> Path:
-        page_path = self._root / f"{slug}.md"
+    def _iter_subfolders(self):
+        """Yield immediate subdirectories of the wiki root, skipping dotfiles."""
+        for p in self._root.iterdir():
+            if p.is_dir() and not p.name.startswith("."):
+                yield p
+
+    def _find_existing_path(self, slug: str) -> Optional[Path]:
+        """Locate <slug>.md across the wiki root and its subfolders.
+
+        Root takes precedence; subfolders are checked in alphabetical order.
+        Returns None if no file matches. Pages can sit anywhere in this layout
+        because slugs (and therefore [[wikilinks]]) are unique per wiki.
+        """
+        root_match = self._root / f"{slug}.md"
+        if root_match.exists():
+            return root_match
+        for sub in sorted(self._iter_subfolders(), key=lambda p: p.name):
+            cand = sub / f"{slug}.md"
+            if cand.exists():
+                return cand
+        return None
+
+    def _page_path(self, slug: str, folder: Optional[str] = None) -> Path:
+        """Return the on-disk path for reading or writing a page.
+
+        Existing pages keep their location — the `folder` arg is ignored.
+        For a new page, `folder` selects a subdirectory beneath the wiki root;
+        omit to keep the page at the root.
+        """
+        existing = self._find_existing_path(slug)
+        if existing is not None:
+            self._assert_in_root(existing)
+            return existing
+        if folder:
+            page_path = self._root / folder / f"{slug}.md"
+        else:
+            page_path = self._root / f"{slug}.md"
         self._assert_in_root(page_path)
         return page_path
 
@@ -85,6 +123,7 @@ class WikiStorage:
         slug: str,
         page_or_content,
         frontmatter: Optional[dict] = None,
+        folder: Optional[str] = None,
     ) -> None:
         if isinstance(page_or_content, WikiPage):
             page = page_or_content
@@ -108,12 +147,13 @@ class WikiStorage:
 
         yaml_str = yaml.dump(fm, default_flow_style=False, allow_unicode=True)
         text = f"---\n{yaml_str}---\n\n{body}"
-        target = self._page_path(slug)
+        target = self._page_path(slug, folder=folder)
+        target.parent.mkdir(parents=True, exist_ok=True)
         target.write_text(text, encoding="utf-8")
 
     def read_page(self, slug: str) -> Optional[WikiPage]:
-        target = self._page_path(slug)
-        if not target.exists():
+        target = self._find_existing_path(slug)
+        if target is None:
             return None
 
         raw = target.read_text(encoding="utf-8")
@@ -130,6 +170,8 @@ class WikiStorage:
         sources = _sources_from_dicts(fm.get("sources", []))
         raw_cats = fm.get("categories", [])
         categories = raw_cats if isinstance(raw_cats, list) else [raw_cats] if raw_cats else []
+        rel_parent = target.parent.relative_to(self._root)
+        folder = None if str(rel_parent) == "." else str(rel_parent).replace("\\", "/")
         return WikiPage(
             title=fm.get("title", ""),
             tags=fm.get("tags", []),
@@ -141,13 +183,34 @@ class WikiStorage:
             orphan=bool(fm.get("orphan", False)),
             categories=categories,
             consolidated_hash=fm.get("consolidated_hash") or None,
+            folder=folder,
         )
 
     def page_exists(self, slug: str) -> bool:
-        return self._page_path(slug).exists()
+        return self._find_existing_path(slug) is not None
+
+    def iter_page_paths(self) -> list[tuple[str, Path]]:
+        """Return (slug, path) for every page in the root and its subfolders.
+
+        Root pages first, then one level of subfolders alphabetically. If a slug
+        exists in both root and a subfolder, the root version wins (matches
+        `_find_existing_path`).
+        """
+        out: list[tuple[str, Path]] = []
+        seen: set[str] = set()
+        for p in sorted(self._root.glob("*.md")):
+            if p.stem not in seen:
+                seen.add(p.stem)
+                out.append((p.stem, p))
+        for sub in sorted(self._iter_subfolders(), key=lambda p: p.name):
+            for p in sorted(sub.glob("*.md")):
+                if p.stem not in seen:
+                    seen.add(p.stem)
+                    out.append((p.stem, p))
+        return out
 
     def list_pages(self) -> list[str]:
-        return [p.stem for p in self._root.glob("*.md")]
+        return [slug for slug, _ in self.iter_page_paths()]
 
     def append_to_index(self, slug: str, title: str) -> None:
         """Append a newly created page entry to wiki/index.md under 'Recently Added'.

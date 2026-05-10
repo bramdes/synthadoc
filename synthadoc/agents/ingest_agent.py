@@ -77,7 +77,13 @@ _DECISION_PROMPT = (
     "    \"update_content\":\"## <descriptive section heading> (YYYY-MM-DD)\\n\\n<detailed body>\"}}\n\n"
     "CREATE — only if the subject is NOT in any existing page:\n"
     "  {{\"action\":\"create\", \"new_slug\":\"topic-slug\",\n"
+    "    \"folder\":\"<optional folder name>\",\n"
     "    \"page_content\":\"# <Title>\\n\\n<full body with [[slug]] links>\"}}\n\n"
+    "FOLDER: When creating a page, set `folder` to a subdirectory under the wiki root\n"
+    "if the wiki guidelines (in the system message) define a convention for this kind\n"
+    "of subject — e.g. `people`, `projects`, `situations`. Omit `folder` to keep the\n"
+    "page at the wiki root. Slugs are unique across folders, so `[[slug]]` wikilinks\n"
+    "always resolve regardless of folder choice.\n\n"
     "SKIP — if a subject is out of scope per the wiki guidelines, omit it (do not emit\n"
     "an action). If NO subject is in scope, return actions: [] with reasoning.\n\n"
     "DETAIL REQUIREMENT: each update_content / page_content must be COMPREHENSIVE for\n"
@@ -237,8 +243,9 @@ class IngestAgent:
             return
         wiki_dir = self._wiki_root / "wiki"
         pages = sorted(
-            [p for p in wiki_dir.glob("*.md")
-             if p.stem not in {"overview", "index", "dashboard", "log"}],
+            [p for p in wiki_dir.rglob("*.md")
+             if p.stem not in {"overview", "index", "dashboard", "log"}
+             and not any(part.startswith(".") for part in p.relative_to(wiki_dir).parts)],
             key=lambda p: p.stat().st_mtime,
             reverse=True,
         )[:10]
@@ -605,6 +612,7 @@ class IngestAgent:
                 result.pages_updated.append(slug)
                 return
 
+            folder = self._sanitize_folder(act.get("folder"))
             page_title = self._title_from_page_content(page_content) or slug.replace("-", " ").title()
             new_page = WikiPage(
                 title=page_title, tags=tags,
@@ -613,13 +621,29 @@ class IngestAgent:
                 created=datetime.now(timezone.utc).strftime("%Y-%m-%d"),
             )
             with self._store.page_lock(slug):
-                self._store.write_page(slug, new_page)
+                self._store.write_page(slug, new_page, folder=folder)
                 self._search.invalidate_index()
             result.pages_created.append(slug)
             self._store.append_to_index(slug, new_page.title)
             return
 
         logger.warning("Unknown action kind: %r", kind)
+
+    @staticmethod
+    def _sanitize_folder(raw: object) -> Optional[str]:
+        """Validate the LLM-supplied folder name. Reject anything other than a
+        single safe path segment so a stray '../' or absolute path can't escape
+        the wiki root. Empty / missing → None (page lands at the root)."""
+        if not raw or not isinstance(raw, str):
+            return None
+        name = raw.strip().strip("/\\")
+        if not name or name in (".", ".."):
+            return None
+        if any(c in name for c in ("/", "\\")) or name.startswith("."):
+            return None
+        if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_\-]*", name):
+            return None
+        return name
 
     @staticmethod
     def _source_provenance(p, source: str) -> tuple[str, str]:
