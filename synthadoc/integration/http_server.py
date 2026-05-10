@@ -89,6 +89,10 @@ def _classify_llm_error(exc: Exception) -> "HTTPException | None":
         )
     return None
 _WORKER_POLL_SECONDS = 2
+# Backstop for a single job. Per-LLM-call timeouts (agents.llm_timeout_seconds)
+# are the primary defense; this guard only fires if a provider lacks request
+# timeout enforcement and a call hangs the whole worker.
+_WORKER_JOB_TIMEOUT_SECONDS = 30 * 60
 _WIKILINK_RE = re.compile(r"\[\[([^\]]+)\]\]")
 _FM_RE = re.compile(r"^---\s*\n(.*?)\n---", re.DOTALL)
 
@@ -182,19 +186,43 @@ async def _worker_loop(orch) -> None:
             job = await orch.queue.dequeue()
             sleep_secs = _WORKER_POLL_SECONDS  # reset after a successful dequeue
             if job:
-                if job.operation == "ingest":
-                    source = job.payload.get("source", "")
-                    force = job.payload.get("force", False)
-                    max_results = job.payload.get("max_results")
-                    await orch._run_ingest(job.id, source, auto_confirm=True, force=force,
-                                           max_results=max_results)
-                elif job.operation == "lint":
-                    scope = job.payload.get("scope", "all")
-                    auto_resolve = job.payload.get("auto_resolve", False)
-                    await orch._run_lint(job.id, scope=scope, auto_resolve=auto_resolve)
-                elif job.operation == "scaffold":
-                    domain = job.payload.get("domain", "")
-                    await orch._run_scaffold(job.id, domain=domain)
+                try:
+                    async with asyncio.timeout(_WORKER_JOB_TIMEOUT_SECONDS):
+                        if job.operation == "ingest":
+                            source = job.payload.get("source", "")
+                            force = job.payload.get("force", False)
+                            max_results = job.payload.get("max_results")
+                            await orch._run_ingest(job.id, source, auto_confirm=True, force=force,
+                                                   max_results=max_results)
+                        elif job.operation == "lint":
+                            scope = job.payload.get("scope", "all")
+                            auto_resolve = job.payload.get("auto_resolve", False)
+                            await orch._run_lint(job.id, scope=scope, auto_resolve=auto_resolve)
+                        elif job.operation == "scaffold":
+                            domain = job.payload.get("domain", "")
+                            await orch._run_scaffold(job.id, domain=domain)
+                except TimeoutError:
+                    # Cancellation propagated as TimeoutError out of the inner
+                    # await — the orchestrator's try/except never ran, so the
+                    # job is still in_progress. Mark it failed here so the
+                    # queue keeps moving.
+                    logger.error(
+                        "Worker job %s (%s) exceeded %ds and was cancelled. "
+                        "Lower [agents] llm_timeout_seconds in config.toml so "
+                        "individual LLM calls fail fast.",
+                        job.id, job.operation, _WORKER_JOB_TIMEOUT_SECONDS,
+                    )
+                    try:
+                        await orch.queue.fail(
+                            job.id,
+                            f"worker timeout: exceeded {_WORKER_JOB_TIMEOUT_SECONDS}s "
+                            f"(likely a hung provider call)",
+                        )
+                    except Exception:
+                        logger.exception(
+                            "Could not mark job %s as failed after worker timeout",
+                            job.id,
+                        )
         except Exception as exc:
             known = _classify_llm_error(exc)
             if known and known.status_code == 503 and "Daily quota" in (known.detail or ""):
