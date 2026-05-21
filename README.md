@@ -30,11 +30,30 @@
 
 **Document version: v0.2.0**
 
-**Engineered for solo users and enterprises alike, providing a domain-specific knowledge base that scales seamlessly while maintaining accuracy through autonomous self-optimization.**
+**An LLM-driven engine that compiles raw documents into a curated, cross-referenced Markdown wiki.**
 
-> Built for individuals, small teams, and large organizations who need a knowledge base that stays accurate as documents accumulate.
+Synthadoc is a local-first CLI + HTTP server. It ingests PDFs, DOCX, PPTX, XLSX, images, web pages, YouTube transcripts, and meeting transcripts; runs each source through an LLM that decides which wiki pages to create, update, or flag; and emits [Obsidian](https://obsidian.md)-compatible Markdown with YAML frontmatter, `[[wikilinks]]`, and per-section provenance footers. Sources are decomposed by topic, so one meeting transcript can update multiple long-lived pages (project, person, open issue) in a single pass.
 
-Synthadoc reads your raw source documents — PDFs, spreadsheets, PPTs, web pages, images, Word files, TXTs — and uses an LLM to synthesize them into a persistent, structured wiki. Cross-references are built automatically, contradictions are detected and surfaced, orphan pages are flagged, and every answer cites its sources. Outputs are stored as local Markdown files, ensuring seamless integration and autonomous management within [Obsidian](https://obsidian.md) or any wiki-compliant ecosystem.
+The wiki is the artifact — stop the server and the folder is still a readable, editable knowledge base in any Markdown tool. Contradictions are surfaced rather than blended, orphan pages are flagged for linking, and every answer cites its sources.
+
+---
+
+## What's Different in This Fork
+
+This is a downstream fork of [paulmchen/synthadoc](https://github.com/paulmchen/synthadoc), focused on turning Synthadoc into a living project / people / topic wiki driven by raw meeting transcripts. Changes layered on top of upstream:
+
+| Area | Change |
+| --- | --- |
+| **Multi-action ingest** | A single source fans out into one action per distinct subject. A meeting transcript can update the project page, the person page, and an open-issue page in a single pass. Date-prefixed and `meeting-with-…` slugs are rejected so meeting events never become first-class pages. |
+| **Source detail preservation** | The decision LLM sees the full source body, not a 3-sentence summary. Truncation caps raised to 30–40 KB end-to-end so a 40 KB transcript no longer collapses to a ~1 KB stub. The analysis pass is now purely entity/tag extraction for BM25 candidate search. |
+| **Provenance footers** | Every appended section ends with `_— Source: <label> · YYYY-MM-DD_`, parsed from the source filename when it starts with a date. Individual facts stay traceable as pages accumulate. |
+| **`synthadoc consolidate <slug>`** | New CLI command + `ConsolidateAgent` that rewrites an accumulated page into a curated, topic-organised form. Preserves every `[[wikilink]]` and provenance line verbatim, guards against shrinkage (configurable length floor) and data loss (wikilink/source-line set must be a subset of the rewrite), writes a pre-rewrite backup under `.synthadoc/consolidate-backups/`, and supports `--dry-run`. Idempotent — stamps `consolidated_hash` into frontmatter and skips re-runs when the body hasn't changed. |
+| **Subfolder layout** | Pages can live one level deep — `wiki/people/<slug>.md`, `wiki/projects/<slug>.md`, etc. The ingest LLM can pick a `folder` per `create` action; slugs stay globally unique so `[[wikilinks]]` resolve regardless of folder. Lint, scaffold, and the `/lint/report` endpoint walk the same tree. |
+| **Wiki context in queries** | `AGENTS.md` and `wiki/purpose.md` are threaded into the QueryAgent system prompt (previously only ingest saw them), so answers respect the wiki's audience and scope. |
+| **Worker timeout backstop** | Each job is wrapped in a 30-minute `asyncio.timeout`. A single hung provider call no longer wedges the entire backlog — the job fails, the queue keeps moving. Per-LLM-call `[agents] llm_timeout_seconds` remains the primary defense. |
+| **`purpose.md` size cap removed** | The 500-character cap on `purpose.md` is gone — write the full scope statement the LLM should respect. |
+
+The `CACHE_VERSION` has been bumped (now 7) so prior cached analyses and decisions made under upstream prompts are not reused.
 
 ---
 
@@ -161,9 +180,53 @@ For full architecture details, data models, API reference, and plugin developmen
 
 ---
 
-## What's Included
+## Features
 
-See [docs/design.md — Appendix A: Release Feature Index](docs/design.md#appendix-a--release-feature-index) for a full feature list by version.
+### Ingest, synthesis, retrieval
+
+- **Multi-format ingest** — PDF, DOCX, PPTX, XLSX/CSV, Markdown, TXT, images (via vision-capable LLMs), HTML/URLs, YouTube transcripts. Pluggable via `BaseSkill` subclasses dropped in `~/.synthadoc/skills/` or `<wiki>/skills/`.
+- **Two-pass ingest** — entity/tag extraction for BM25 candidate search, then a per-subject decision LLM that fans out into one action (`create` / `update` / `flag`) per distinct subject in the source.
+- **Source decomposition** — a single mixed-subject source produces one action per long-lived page. A meeting transcript covering a project, two people, and an open issue produces four actions, one updating each page.
+- **Provenance footers** — every appended section ends with `_— Source: <label> · YYYY-MM-DD_` so individual facts stay traceable as pages accumulate.
+- **Subfolder layout** — pages can live one level deep (`wiki/people/`, `wiki/projects/`); slugs stay globally unique so `[[wikilinks]]` resolve regardless of folder.
+- **BM25 + optional vector re-ranking** — keyword search by default; opt in to `fastembed` + `BAAI/bge-small-en-v1.5` cosine re-ranking with `[search] vector = true`.
+- **Query decomposition** — compound questions split into parallel BM25 sub-queries, then merged before synthesis.
+- **Web ingest** — Tavily-backed `search for: …` jobs with parallel sub-search decomposition. YouTube URLs are routed to transcript extraction automatically.
+
+### Wiki maintenance
+
+- **Contradiction detection** — pages with `status: contradicted` are surfaced by `lint`; high-confidence resolutions are auto-applied, others queue for human review.
+- **Orphan detection** — pages referenced by no other content page are flagged with ready-to-paste index entries.
+- **`scaffold`** — regenerates `index.md`, `purpose.md`, and `AGENTS.md` from current wiki content; never touches pages already linked in the index. Idempotent across runs.
+- **`consolidate`** — rewrites an accumulated page (e.g. a project page with 20 meetings appended) into curated, topic-organised form. Hard safeguards: every `[[wikilink]]` and `_— Source:_` line must survive; the rewrite cannot shrink below `before × 0.5`; pre-rewrite content is backed up under `.synthadoc/consolidate-backups/`. Idempotent via `consolidated_hash` in frontmatter, with `--dry-run` and `--force`.
+
+### LLM providers
+
+- **Seven backends wired in** — Anthropic, OpenAI, Gemini, Groq, DeepSeek, MiniMax, Ollama (local). Per-agent role override (ingest / query / lint / skill / scaffold / default) in `[agents]` config.
+- **Custom providers** — subclass `LLMProvider`, drop in `~/.synthadoc/providers/`, hot-load.
+
+### Operations
+
+- **Persistent job queue** — SQLite-backed (`jobs.db`); states `pending` → `in_progress` → `completed` / `failed` / `dead` / `skipped`. Configurable retries; 30-minute per-job `asyncio.timeout` backstop; automatic recovery of in-flight jobs after a crash.
+- **3-layer cache** — embedding store, LLM-response cache (`cache.db`, versioned key), and provider-level prompt cache. `CACHE_VERSION` bump invalidates everything cached under stale prompts.
+- **Audit trail** — `audit.db` records every ingest (source hash, token count, cost, timestamp), every audit event (contradictions, auto-resolves, cost gates), and every query.
+- **Cost guards** — soft-warn and hard-gate token thresholds per operation.
+- **OpenTelemetry** — traces to local JSONL by default; flip to OTLP for Jaeger / Tempo / Honeycomb / Datadog.
+- **Hooks** — shell commands fire on `on_ingest_complete` / `on_lint_complete` with JSON context on stdin; `blocking = true` gates the operation on hook exit code.
+- **Multi-wiki isolation** — each wiki has its own folder, port, config, queue, cache, and audit log; `synthadoc use <name>` sets the default.
+- **Scheduler** — cron-style schedules via `synthadoc schedule add` for recurring ingest / lint / scaffold.
+
+### Interfaces
+
+- **CLI** — `install`, `use`, `serve`, `ingest`, `query`, `lint`, `consolidate`, `scaffold`, `jobs`, `audit`, `cache`, `schedule`, `status`, `uninstall`.
+- **HTTP API** — FastAPI on the per-wiki port; endpoints for `/health`, `/status`, `/query`, `/analyse`, `/jobs/*`, `/consolidate`, `/lint/report`.
+- **Obsidian plugin** — ingest-current-file, ingest-all-sources, query, jobs list, lint report, ingest-from-URL, web-search, lint, lint-auto-resolve.
+
+### Output format
+
+Plain Markdown + YAML frontmatter (`title`, `tags`, `status`, `confidence`, `sources`, `created`, `orphan`, `categories`, `consolidated_hash`). Wikilinks as `[[slug]]`. Readable in any editor, browsable in Obsidian Graph view, queryable with Dataview. No proprietary format, no database lock-in — back it up with git, sync it with any cloud drive.
+
+For the per-version release history see [docs/design.md — Appendix A: Release Feature Index](docs/design.md#appendix-a--release-feature-index).
 
 ---
 
@@ -399,7 +462,13 @@ synthadoc schedule add --op "scaffold" --cron "0 4 * * 0"
 
 ### How decomposition works
 
-Both `query` and web search `ingest` automatically split complex inputs into focused parallel sub-tasks — a compound question becomes multiple BM25 retrievals merged before synthesis; a broad search topic becomes multiple focused Tavily keyword searches whose results are merged and deduplicated. Both fall back gracefully if the LLM decomposition call fails.
+Synthadoc decomposes complex inputs into focused sub-tasks at three points:
+
+- **Query decomposition** — a compound question becomes multiple BM25 retrievals merged before synthesis.
+- **Web search decomposition** — a broad search topic becomes multiple focused Tavily keyword searches whose results are merged and deduplicated.
+- **Source decomposition (this fork)** — a single source becomes one ingest action per distinct subject. A meeting transcript covering a project, two people, and an open issue produces four actions — one updating each long-lived page — rather than a single create or update.
+
+All three fall back gracefully if the LLM decomposition call fails.
 
 See [docs/design.md — Query decomposition and web search decomposition](docs/design.md#query-decomposition) for the full design.
 
@@ -576,6 +645,30 @@ synthadoc lint run --auto-resolve -w my-wiki
 # Instant report (reads wiki files directly, no server needed)
 synthadoc lint report -w my-wiki
 ```
+
+### Consolidating accumulated pages
+
+Pages that grow via repeated ingest appends (a project page that has accumulated sections from twenty meetings, say) can be rewritten into a curated, topic-organised form. `ConsolidateAgent` preserves every `[[wikilink]]` and `_— Source:_` provenance line, deduplicates facts across sections, and refuses to write if any of its safety guards trip.
+
+```bash
+# Preview the rewrite without touching the page
+synthadoc consolidate project-egp --dry-run -w my-wiki
+
+# Run it for real — pre-rewrite body is backed up under
+# .synthadoc/consolidate-backups/<slug>-<UTC-timestamp>.md
+synthadoc consolidate project-egp -w my-wiki
+
+# Re-running on an unchanged page is a no-op (frontmatter records the
+# content hash at last consolidation). Pass --force to override.
+synthadoc consolidate project-egp --force -w my-wiki
+```
+
+Safeguards (each raises and leaves the page untouched if they trip):
+
+- Wikilink preservation — the set of `[[slug]]` before must be a subset of after.
+- Source preservation — every `(label, date)` from `_— Source: …_` lines must survive.
+- Length floor — the rewrite cannot shrink the page below `before × 0.5` (configurable), catching over-summarisation.
+- Provenance footers cannot all be dropped.
 
 ### Monitoring jobs
 
