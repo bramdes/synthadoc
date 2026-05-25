@@ -41,7 +41,8 @@ logger = logging.getLogger(__name__)
 
 PROMPT_VERSION = "v1"
 
-_FENCE_RE = re.compile(r"```(?:json)?\s*(.*?)\s*```", re.DOTALL)
+_FENCE_PAIR_RE = re.compile(r"```(?:json)?\s*(.*?)\s*```", re.DOTALL)
+_FENCE_OPEN_RE = re.compile(r"^```(?:json)?\s*", re.IGNORECASE)
 
 _SYSTEM = (
     "You are an information-extraction assistant. You surface UNKNOWNS — "
@@ -201,7 +202,7 @@ class UnknownExtractAgent:
         for attempt in range(self._max_retries + 1):
             resp = await self._provider.complete(
                 messages=[Message(role="user", content=prompt)],
-                system=_SYSTEM, temperature=0.0, max_tokens=4096,
+                system=_SYSTEM, temperature=0.0, max_tokens=8192,
             )
             in_tok += resp.input_tokens
             out_tok += resp.output_tokens
@@ -345,11 +346,20 @@ class _ValidationError(ValueError):
     pass
 
 
-def _parse_json(text: str) -> dict:
+def _strip_fences(text: str) -> str:
+    """Strip a ```json … ``` fence. Tolerates truncated (no-closer) responses."""
     raw = text.strip()
-    m = _FENCE_RE.search(raw)
+    m = _FENCE_PAIR_RE.search(raw)
     if m:
-        raw = m.group(1)
+        return m.group(1)
+    m = _FENCE_OPEN_RE.match(raw)
+    if m:
+        return raw[m.end():]
+    return raw
+
+
+def _parse_json(text: str) -> dict:
+    raw = _strip_fences(text)
     try:
         data = json.loads(raw)
     except json.JSONDecodeError as exc:

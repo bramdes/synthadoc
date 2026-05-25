@@ -39,8 +39,6 @@ logger = logging.getLogger(__name__)
 
 PROMPT_VERSION = "v1"
 
-_FENCE_RE = re.compile(r"```(?:json)?\s*(.*?)\s*```", re.DOTALL)
-
 _SYSTEM = (
     "You are a careful information-extraction assistant. "
     "Your task is to summarise ONE source document on its own terms. "
@@ -49,8 +47,15 @@ _SYSTEM = (
     "Return ONLY valid JSON — no markdown fences, no commentary."
 )
 
-_PROMPT = """\
-Summarise the source below. Return JSON with this exact shape:
+
+def _prompt(*, title: str, source_type: str, valid_on: str,
+            body: str, retry_hint: str = "") -> str:
+    hint = (f"\nIMPORTANT: previous attempt failed validation:\n{retry_hint}\n"
+            if retry_hint else "")
+    return f"""\
+Summarise the source below.{hint}
+
+Return JSON with this exact shape:
 
 {{
   "summary":        "2-4 sentence neutral precis of what THIS source says.",
@@ -120,11 +125,13 @@ class SourceSummaryAgent:
         db: KBDB,
         layout: KBLayout,
         max_body_chars: int = 40_000,
+        max_retries: int = 1,
     ) -> None:
         self._provider = provider
         self._db = db
         self._layout = layout
         self._max_body_chars = max_body_chars
+        self._max_retries = max_retries
 
     # ------------------------------------------------------------------
 
@@ -215,20 +222,51 @@ class SourceSummaryAgent:
         return body
 
     async def _call_llm(self, source: dict, body: str) -> SourceSummary:
+        """Call the LLM with one retry on parse failure.
+
+        Gemini and similar long-context models sometimes truncate mid-string
+        when the response brushes against ``max_tokens``. The retry feeds the
+        parse error back in the prompt so the model can shorten its output.
+        """
         valid_on = ids.split_source_id(source["id"])[1]
-        prompt = _PROMPT.format(
+        prompt = _prompt(
             title=source["title"],
             source_type=source["source_type"],
             valid_on=valid_on,
             body=body or "(empty source body)",
         )
-        resp = await self._provider.complete(
-            messages=[Message(role="user", content=prompt)],
-            system=_SYSTEM,
-            temperature=0.0,
-            max_tokens=2048,
-        )
-        data = _parse_json(resp.text)
+        input_tokens = 0
+        output_tokens = 0
+        last_err: Optional[str] = None
+        data: dict[str, Any] | None = None
+        for attempt in range(self._max_retries + 1):
+            resp = await self._provider.complete(
+                messages=[Message(role="user", content=prompt)],
+                system=_SYSTEM,
+                temperature=0.0,
+                max_tokens=4096,
+            )
+            input_tokens += resp.input_tokens
+            output_tokens += resp.output_tokens
+            try:
+                data = _parse_json(resp.text)
+                break
+            except ValueError as exc:
+                last_err = str(exc)
+                if attempt == self._max_retries:
+                    raise
+                logger.warning(
+                    "source summary JSON parse failed (attempt %d): %s",
+                    attempt + 1, exc,
+                )
+                prompt = _prompt(
+                    title=source["title"],
+                    source_type=source["source_type"],
+                    valid_on=valid_on,
+                    body=body or "(empty source body)",
+                    retry_hint=last_err,
+                )
+        assert data is not None  # for type-checker; either set or raised
         return SourceSummary(
             summary=str(data.get("summary", "")).strip(),
             key_points=_strip_strs(data.get("key_points", [])),
@@ -237,8 +275,8 @@ class SourceSummaryAgent:
             open_questions=_strip_strs(data.get("open_questions", [])),
             action_items=_strip_strs(data.get("action_items", [])),
             source_reliability=_clean_reliability(data.get("source_reliability", "medium")),
-            input_tokens=resp.input_tokens,
-            output_tokens=resp.output_tokens,
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
         )
 
     def _write_markdown(
@@ -294,12 +332,32 @@ class SourceSummaryAgent:
 # ---------------------------------------------------------------------------
 
 
+_FENCE_PAIR_RE = re.compile(r"```(?:json)?\s*(.*?)\s*```", re.DOTALL)
+_FENCE_OPEN_RE = re.compile(r"^```(?:json)?\s*", re.IGNORECASE)
+
+
+def _strip_fences(text: str) -> str:
+    """Strip a ```json … ``` fence from an LLM response.
+
+    Handles two cases:
+      * Matched-pair fence: ```json\\n{ … }\\n``` → return the inner body.
+      * Opening-only fence (response truncated before the closing fence):
+        ```json\\n{ … (cut off) → strip the opener, keep the rest.
+    """
+    raw = text.strip()
+    m = _FENCE_PAIR_RE.search(raw)
+    if m:
+        return m.group(1)
+    # Opening-fence-only fallback (truncated response)
+    m = _FENCE_OPEN_RE.match(raw)
+    if m:
+        return raw[m.end():]
+    return raw
+
+
 def _parse_json(text: str) -> dict[str, Any]:
     """Parse a JSON blob that the LLM may have wrapped in ```json``` fences."""
-    raw = text.strip()
-    m = _FENCE_RE.search(raw)
-    if m:
-        raw = m.group(1)
+    raw = _strip_fences(text)
     try:
         data = json.loads(raw)
     except json.JSONDecodeError as exc:

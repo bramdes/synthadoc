@@ -190,12 +190,42 @@ async def test_summarise_strips_markdown_fences(wired):
 
 
 async def test_summarise_rejects_invalid_json(wired):
+    """If BOTH the initial call and the one retry return bad JSON, raise."""
     layout, db, src_id = wired
     provider = FakeProvider()
     provider.enqueue("definitely not json")
+    provider.enqueue("still not json")  # retry response
     agent = SourceSummaryAgent(provider=provider, db=db, layout=layout)
     with pytest.raises(ValueError, match="unparseable JSON"):
         await agent.summarise(src_id)
+    assert len(provider.calls) == 2  # initial + one retry
+
+
+async def test_summarise_retries_on_parse_failure_and_recovers(wired):
+    """First response is broken JSON (truncated); retry succeeds."""
+    layout, db, src_id = wired
+    provider = FakeProvider()
+    provider.enqueue('{"summary": "truncated mid-stri')  # truncated
+    provider.enqueue(_CANNED_GOOD)                       # retry: full
+    agent = SourceSummaryAgent(provider=provider, db=db, layout=layout)
+    result = await agent.summarise(src_id)
+    assert result.cached is False
+    assert result.summary_path.exists()
+    assert len(provider.calls) == 2
+    # Retry prompt mentions the previous failure
+    retry_prompt = provider.calls[1].messages[0].content
+    assert "previous attempt failed validation" in retry_prompt
+
+
+async def test_summarise_strips_truncated_opening_fence(wired):
+    """LLM wraps response in ```json``` but the closing fence is truncated."""
+    layout, db, src_id = wired
+    provider = FakeProvider()
+    truncated = "```json\n" + _CANNED_GOOD  # opener present, no closer
+    provider.enqueue(truncated)
+    agent = SourceSummaryAgent(provider=provider, db=db, layout=layout)
+    result = await agent.summarise(src_id)
+    assert "Drop 1" in result.summary.summary or "complete" in result.summary.summary.lower()
 
 
 async def test_summarise_drops_invalid_entity_types(wired):
