@@ -69,6 +69,39 @@ This wiki captures knowledge about: {domain}.
 ## Query Guidelines
 - Answer using only wiki content
 - Always cite sources using `[[page-name]]` link syntax
+{temporal_section}"""
+
+# Appended to AGENTS.md when the wiki has a temporal-KB tier initialised.
+# Based on spec §6.2 with the rules slimmed to what an LLM agent needs to know
+# at navigation time.
+_TEMPORAL_KB_SECTION = """\
+
+## Temporal KB Rules
+
+This wiki has a fact-tier knowledge base under `kb/`. The page tier (`wiki/`)
+remains the user-facing artifact; the fact tier is the source-of-truth index
+for timestamped, source-backed facts.
+
+Layout:
+- `kb/sources/raw/` — immutable raw source files. NEVER modify these.
+- `kb/sources/parsed/` — parsed copies for processing. Treat as immutable too.
+- `kb/source_summaries/` — one summary per source, bounded to that source's content.
+- `kb/facts/` — atomic timestamped facts. Each must link to a verbatim source quote.
+- `kb/entities/` — synthesised current-state views of projects / people / topics.
+- `kb/decisions/` — explicit decision records.
+- `kb/unknowns/` — explicit gaps and open questions.
+- `kb/maintenance/` — generated reports (conflicts, broken links, stale pages, kb health).
+
+Rules:
+- Do not modify any file under `kb/sources/raw/`.
+- Do not convert a derived conclusion into an observed fact.
+- Every fact must carry a verbatim `source_quote` substring of its parsed source.
+- Mark a fact superseded via the `superseded_by` column or `supersedes:` frontmatter —
+  never by deletion.
+- Reviewed entity pages (`current_state_review_status: reviewed`) must not be
+  silently overwritten; propose updates in `kb/maintenance/review_queue.md`.
+- People pages must be professional and bounded — see spec §3.7. The
+  `people_pages_flags.md` maintenance report flags violations.
 """
 
 _PURPOSE_MD_TEMPLATE = """\
@@ -97,6 +130,8 @@ class ScaffoldAgent:
         self,
         domain: str,
         protected_slugs: Optional[list[str]] = None,
+        *,
+        kb_initialized: bool = False,
     ) -> ScaffoldResult:
         protected_section = ""
         slugs_instruction = ""
@@ -138,7 +173,7 @@ class ScaffoldAgent:
 
         return ScaffoldResult(
             index_md=self._build_index_md(domain, data),
-            agents_md=self._build_agents_md(domain, data),
+            agents_md=self._build_agents_md(domain, data, kb_initialized=kb_initialized),
             purpose_md=self._build_purpose_md(domain, data),
             dashboard_intro=data.get("dashboard_intro", f"A wiki tracking {domain} knowledge."),
         )
@@ -162,7 +197,8 @@ class ScaffoldAgent:
         lines.append("")
         return "\n".join(lines)
 
-    def _build_agents_md(self, domain: str, data: dict) -> str:
+    def _build_agents_md(self, domain: str, data: dict,
+                         *, kb_initialized: bool = False) -> str:
         raw_guidelines = data.get("agents_guidelines", "Summarize key claims.")
         # Normalise to bullet list
         bullets = []
@@ -171,7 +207,11 @@ class ScaffoldAgent:
             if line:
                 bullets.append(f"- {line}")
         guidelines = "\n".join(bullets) if bullets else f"- {raw_guidelines}"
-        return _AGENTS_MD_TEMPLATE.format(domain=domain, guidelines=guidelines)
+        temporal_section = _TEMPORAL_KB_SECTION if kb_initialized else ""
+        return _AGENTS_MD_TEMPLATE.format(
+            domain=domain, guidelines=guidelines,
+            temporal_section=temporal_section,
+        )
 
     def _build_purpose_md(self, domain: str, data: dict) -> str:
         return _PURPOSE_MD_TEMPLATE.format(

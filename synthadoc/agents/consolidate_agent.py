@@ -46,6 +46,15 @@ _WIKILINK_RE = re.compile(r"\[\[([^\]\|#]+)(?:[\|#][^\]]*)?\]\]")
 _SOURCE_LINE_RE = re.compile(
     r"_—\s*Source:\s*(?P<label>.+?)\s*·\s*(?P<date>\d{4}-\d{2}-\d{2})\s*_"
 )
+# Fact-tier page types — consolidate refuses to rewrite these because they
+# are deterministically rendered by the resolver/agent and any LLM edit
+# would corrupt the source-of-truth in kb.db. Plan §14 Q4.
+_FACT_TIER_TYPES = frozenset({
+    "entity", "fact", "decision", "unknown", "history",
+    "source", "source_summary", "derived_conclusion",
+    "maintenance_report",
+})
+_TYPE_LINE_RE = re.compile(r"^type:\s*(\S+)\s*$", re.MULTILINE)
 
 
 @dataclass
@@ -85,6 +94,18 @@ class ConsolidateAgent:
         page = self._store.read_page(slug)
         if page is None:
             raise ValueError(f"Page not readable: {slug}")
+
+        fact_tier_type = self._fact_tier_type(slug)
+        if fact_tier_type:
+            return ConsolidateResult(
+                slug=slug, skipped=True,
+                skip_reason=(
+                    f"refusing to consolidate fact-tier page (type: {fact_tier_type}) "
+                    f"— these pages are deterministically rendered; re-run the kb "
+                    f"pipeline or maintenance to refresh them"
+                ),
+                before_chars=len(page.content), after_chars=len(page.content),
+            )
 
         before = page.content
         before_hash = hashlib.sha256(before.encode("utf-8")).hexdigest()
@@ -156,6 +177,32 @@ class ConsolidateAgent:
             output_tokens=resp.output_tokens,
             backup_path=str(backup_path) if backup_path else None,
         )
+
+    def _fact_tier_type(self, slug: str) -> str | None:
+        """Return the page's ``type:`` field if it identifies a fact-tier page.
+
+        Reads the raw frontmatter block (first ``---``…``---`` fence) so this
+        check works even if WikiStorage's parsed dataclass loses the field.
+        Returns ``None`` for ordinary wiki pages (no `type:` key or a value
+        outside :data:`_FACT_TIER_TYPES`).
+        """
+        path = self._store._find_existing_path(slug)
+        if path is None:
+            return None
+        try:
+            text = path.read_text(encoding="utf-8")
+        except OSError:
+            return None
+        if not text.startswith("---"):
+            return None
+        parts = text.split("---", 2)
+        if len(parts) < 3:
+            return None
+        match = _TYPE_LINE_RE.search(parts[1])
+        if not match:
+            return None
+        value = match.group(1).strip().strip("'\"")
+        return value if value in _FACT_TIER_TYPES else None
 
     @staticmethod
     def _strip_code_fences(text: str) -> str:

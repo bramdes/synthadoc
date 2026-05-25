@@ -1,0 +1,428 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 Paul Chen / axoviq.com
+"""CLI for the temporal KB tier.
+
+Sub-commands:
+
+    synthadoc kb init                Scaffold kb/ folder + kb.db
+    synthadoc kb import-source PATH  Import a raw source into kb/sources/raw/
+    synthadoc kb backfill            Seed sources from audit.db.ingests
+
+The CLI is intentionally thin — it delegates to :mod:`synthadoc.kb`. New
+behaviour belongs in the library, not in this file.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import sqlite3
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Optional
+
+import typer
+
+from synthadoc import errors as E
+from synthadoc.cli._wiki import resolve_wiki
+from synthadoc.cli.install import resolve_wiki_path
+from synthadoc.cli.main import app
+from synthadoc.kb import ids
+from synthadoc.kb.db import KBDB
+from synthadoc.kb.import_source import import_source as _import_source_impl
+from synthadoc.kb.layout import KBLayout
+
+kb_app = typer.Typer(name="kb", help="Temporal KB (fact tier) commands.")
+
+
+# ---------------------------------------------------------------------------
+# Shared helpers
+# ---------------------------------------------------------------------------
+
+
+# Default kb_config.yaml — resolution rules per plan §8.
+_DEFAULT_KB_CONFIG = """\
+# synthadoc Temporal KB resolution rules — plan §8
+#
+# Each fact_type names a strategy used by the resolver to derive current state
+# from the timestamped facts table. Edit and restart the maintenance jobs;
+# the markdown is the durable truth, so changing this file is non-destructive.
+
+resolution_rules:
+  project.status:
+    strategy: latest_valid_at_wins
+    minimum_confidence: medium
+    exclude_review_status: [rejected]
+
+  project.owner:
+    strategy: latest_valid_at_wins
+    minimum_confidence: medium
+
+  project.scope:
+    strategy: requires_review
+
+  project.milestone:
+    strategy: append_only
+
+  person.role_on_project:
+    strategy: latest_valid_at_wins
+    minimum_confidence: medium
+
+  topic.definition:
+    strategy: latest_valid_at_wins
+    minimum_confidence: medium
+
+  requirement.coverage:
+    strategy: requires_review
+
+  decision.made:
+    strategy: append_only
+    reversal_required: true
+
+  open_issue.created:
+    strategy: open_until_closure_fact
+
+  open_issue.closed:
+    strategy: append_only
+
+  assumption.created:
+    strategy: open_until_resolved
+
+  assumption.invalidated:
+    strategy: append_only
+"""
+
+
+# Stub bodies for the maintenance pages — created empty so they show up in
+# the wiki immediately even before any job has run.
+_MAINTENANCE_STUBS = {
+    "review_queue.md": "# Review Queue\n\nProposed updates to reviewed entity pages will be appended here.\n",
+    "stale_pages.md": "# Stale Entity Pages\n\n_No entries yet — run `synthadoc kb maintenance run`._\n",
+    "conflicts.md": "# Conflicts\n\n_No entries yet — run `synthadoc kb maintenance run`._\n",
+    "orphan_facts.md": "# Orphan Facts\n\n_No entries yet — run `synthadoc kb maintenance run`._\n",
+    "duplicate_entities.md": "# Duplicate Entity Candidates\n\n_No entries yet — run `synthadoc kb maintenance run`._\n",
+    "broken_links.md": "# Broken Links\n\n_No entries yet — run `synthadoc kb maintenance run`._\n",
+    "kb_health.md": "# KB Health\n\n_No entries yet — run `synthadoc kb maintenance run`._\n",
+}
+
+
+def _resolve_wiki_root(wiki: Optional[str]) -> Path:
+    """Look up the wiki root path or exit with a friendly error."""
+    name = resolve_wiki(wiki)
+    root = resolve_wiki_path(name)
+    if not root.exists():
+        E.cli_error(
+            E.WIKI_NOT_FOUND,
+            f"Wiki directory not found: {root}",
+            "Check the wiki name or path.",
+        )
+    cfg = root / ".synthadoc" / "config.toml"
+    if not cfg.exists():
+        E.cli_error(
+            E.WIKI_INVALID,
+            f"No .synthadoc/config.toml at {root}",
+            "Is this a valid synthadoc wiki directory?",
+        )
+    return root
+
+
+# ---------------------------------------------------------------------------
+# kb init
+# ---------------------------------------------------------------------------
+
+
+@kb_app.command("init")
+def init_cmd(
+    wiki: Optional[str] = typer.Option(None, "--wiki", "-w", help="Wiki name or path"),
+):
+    """Scaffold the kb/ folder and create kb.db for the temporal tier.
+
+    Idempotent — safe to run on a wiki that has been partially initialised.
+    Never touches files under wiki/.
+    """
+    root = _resolve_wiki_root(wiki)
+    layout = KBLayout(root)
+    layout.ensure_layout()
+
+    # Maintenance stubs
+    for name, body in _MAINTENANCE_STUBS.items():
+        target = layout.maintenance_dir / name
+        if not target.exists():
+            target.write_text(body, encoding="utf-8", newline="\n")
+
+    # kb_config.yaml — only write if missing so user edits survive re-init
+    if not layout.config_path.exists():
+        layout.config_path.write_text(_DEFAULT_KB_CONFIG, encoding="utf-8", newline="\n")
+
+    # Create kb.db
+    async def _init_db():
+        db = KBDB(layout.db_path)
+        await db.init()
+
+    asyncio.run(_init_db())
+
+    typer.echo("KB tier initialised.")
+    typer.echo(f"  kb/          {layout.kb}")
+    typer.echo(f"  kb.db        {layout.db_path}")
+    typer.echo(f"  config       {layout.config_path}")
+
+
+# ---------------------------------------------------------------------------
+# kb import-source
+# ---------------------------------------------------------------------------
+
+
+@kb_app.command("import-source")
+def import_source_cmd(
+    path: str = typer.Argument(..., help="Path to the source file"),
+    source_type: str = typer.Option(
+        ..., "--type", "-t",
+        help="One of: meeting_transcript, document, email, deck, note",
+    ),
+    title: Optional[str] = typer.Option(
+        None, "--title",
+        help="Human-readable title (default: filename stem)",
+    ),
+    valid_on: Optional[str] = typer.Option(
+        None, "--date",
+        help="Source date YYYY-MM-DD (default: parsed from filename, else today UTC)",
+    ),
+    authority: str = typer.Option(
+        "informal", "--authority",
+        help="formal | informal | unknown",
+    ),
+    author: Optional[str] = typer.Option(None, "--author"),
+    wiki: Optional[str] = typer.Option(None, "--wiki", "-w"),
+):
+    """Import a raw source file into kb/sources/raw/ and record it in kb.db.
+
+    Re-importing the same file (same SHA-256) is a no-op — the existing
+    source id is printed so callers can chain. Files are copied, not moved.
+    """
+    if source_type not in ids.SOURCE_TYPES:
+        E.cli_error(
+            E.INGEST_NOT_FOUND,
+            f"Unknown --type {source_type!r}.",
+            f"Valid types: {', '.join(sorted(ids.SOURCE_TYPES))}",
+        )
+    src = Path(path)
+    if not src.exists() or not src.is_file():
+        E.cli_error(E.INGEST_NOT_FOUND, f"Source file not found: {src}")
+    if src.stat().st_size == 0:
+        E.cli_error(E.INGEST_EMPTY, f"Source file is empty: {src}")
+
+    root = _resolve_wiki_root(wiki)
+    layout = KBLayout(root)
+    layout.ensure_layout()
+
+    async def _run() -> tuple[str, bool]:
+        db = KBDB(layout.db_path)
+        await db.init()
+        try:
+            return await _import_source_impl(
+                src_path=src, source_type=source_type, db=db, layout=layout,
+                title=title, valid_on=valid_on, authority=authority, author=author,
+            )
+        except sqlite3.IntegrityError as exc:
+            raise typer.Exit(code=1) from exc
+
+    src_id, was_existing = asyncio.run(_run())
+    if was_existing:
+        typer.echo(f"Already imported as {src_id} (sha256 match).")
+    else:
+        typer.echo(f"Imported: {src_id}")
+
+
+# ---------------------------------------------------------------------------
+# kb backfill — seed sources from existing audit.db.ingests
+# ---------------------------------------------------------------------------
+
+
+@kb_app.command("backfill")
+def backfill_cmd(
+    wiki: Optional[str] = typer.Option(None, "--wiki", "-w"),
+    dry_run: bool = typer.Option(False, "--dry-run", help="Show what would be done; write nothing"),
+):
+    """Seed kb.db from audit.db.ingests.
+
+    Walks the existing ingest audit table and creates one ``sources`` row per
+    record. Files that still exist on disk are linked via ``raw_path``;
+    missing files are recorded with ``raw_path = NULL`` and
+    ``authority = unknown`` so the gap is visible.
+
+    Idempotent — re-running skips sha256 values already present.
+    """
+    from synthadoc.storage.log import AuditDB
+    root = _resolve_wiki_root(wiki)
+    layout = KBLayout(root)
+    layout.ensure_layout()
+
+    async def _run() -> tuple[int, int, int]:
+        import aiosqlite
+        audit_path = root / ".synthadoc" / "audit.db"
+        # init() ensures the table exists even on wikis that have never ingested
+        await AuditDB(audit_path).init()
+        # Read the full row (source_hash is not in the public list_ingests projection)
+        async with aiosqlite.connect(audit_path) as adb:
+            adb.row_factory = aiosqlite.Row
+            async with adb.execute(
+                "SELECT source_hash, source_size, source_path, wiki_page, "
+                "tokens, cost_usd, ingested_at FROM ingests ORDER BY id ASC"
+            ) as cur:
+                rows = await cur.fetchall()
+        records = [dict(r) for r in rows]
+
+        db = KBDB(layout.db_path)
+        await db.init()
+
+        seeded = 0
+        skipped_dup = 0
+        skipped_missing_hash = 0
+
+        for r in records:
+            sha = r.get("source_hash")
+            if not sha:
+                skipped_missing_hash += 1
+                continue
+            existing = await db.find_source_by_sha256(sha)
+            if existing is not None:
+                skipped_dup += 1
+                continue
+
+            source_path = Path(r.get("source_path") or "")
+            file_present = source_path.exists() and source_path.is_file()
+            ingested_at = r.get("ingested_at") or datetime.now(timezone.utc).isoformat()
+            iso_date = (ingested_at[:10] if len(ingested_at) >= 10
+                        else datetime.now(timezone.utc).date().isoformat())
+
+            # Best-effort source_type from extension; default to "document"
+            ext = source_path.suffix.lower()
+            source_type = {
+                ".md": "document", ".txt": "document",
+                ".pdf": "document", ".docx": "document",
+                ".pptx": "deck", ".xlsx": "document", ".csv": "document",
+            }.get(ext, "document")
+
+            slug_seed = source_path.stem or sha[:8]
+            base_slug = ids.slugify(slug_seed) if slug_seed else f"x-{sha[:8]}"
+            base_id = ids.source_id(source_type, iso_date, base_slug)
+            # Resolve any collision among already-backfilled IDs
+            n = 1
+            candidate = base_id
+            while await db.source_exists(candidate):
+                n += 1
+                candidate = f"{base_id}-{n}"
+            src_id = candidate
+
+            if dry_run:
+                typer.echo(f"would seed: {src_id}  (file={'present' if file_present else 'missing'})")
+                seeded += 1
+                continue
+
+            await db.insert_source(
+                id=src_id,
+                source_type=source_type,
+                title=source_path.stem or src_id,
+                authority="informal" if file_present else "unknown",
+                raw_path=str(source_path).replace("\\", "/") if file_present else None,
+                parsed_path=None,
+                created_at=ingested_at,
+                ingested_at=ingested_at,
+                sha256=sha,
+                author=None,
+            )
+            seeded += 1
+
+        return seeded, skipped_dup, skipped_missing_hash
+
+    seeded, skipped_dup, skipped_missing = asyncio.run(_run())
+    label = "would seed" if dry_run else "seeded"
+    typer.echo(f"Backfill complete: {seeded} {label}, {skipped_dup} already present, "
+               f"{skipped_missing} skipped (no source_hash).")
+
+
+# ---------------------------------------------------------------------------
+# kb relink — one-shot full rescan of the links table
+# ---------------------------------------------------------------------------
+
+
+@kb_app.command("relink")
+def relink_cmd(
+    wiki: Optional[str] = typer.Option(None, "--wiki", "-w"),
+):
+    """Rebuild the links table from on-disk markdown.
+
+    The render agents emit links on each write, but manual edits or
+    `git checkout` can leave the table stale. Re-run after any bulk edit.
+    """
+    root = _resolve_wiki_root(wiki)
+    layout = KBLayout(root)
+    if not layout.db_path.exists():
+        E.cli_error(
+            E.WIKI_INVALID,
+            "kb.db not found.",
+            "Run `synthadoc kb init` first.",
+        )
+
+    async def _run() -> dict:
+        from synthadoc.kb.links import relink_all
+        db = KBDB(layout.db_path)
+        await db.init()
+        return await relink_all(db, layout)
+
+    counts = asyncio.run(_run())
+    typer.echo(
+        f"Relink complete: {counts['links_emitted']} link(s) from "
+        f"{counts['files']} file(s) ({counts['skipped']} skipped)."
+    )
+
+
+# ---------------------------------------------------------------------------
+# kb maintenance
+# ---------------------------------------------------------------------------
+
+
+maintenance_app = typer.Typer(name="maintenance",
+                              help="Layer 3 maintenance jobs (conflicts, stale, evidence, history).")
+kb_app.add_typer(maintenance_app)
+
+
+@maintenance_app.command("run")
+def maintenance_run_cmd(
+    wiki: Optional[str] = typer.Option(None, "--wiki", "-w"),
+    skip_histories: bool = typer.Option(
+        False, "--skip-histories",
+        help="Skip per-entity history.md re-render (faster)",
+    ),
+):
+    """Run every maintenance job and emit kb_health.md + a timestamped report."""
+    root = _resolve_wiki_root(wiki)
+    layout = KBLayout(root)
+    if not layout.db_path.exists():
+        E.cli_error(
+            E.WIKI_INVALID,
+            "kb.db not found.",
+            "Run `synthadoc kb init` first.",
+        )
+
+    async def _run():
+        from synthadoc.kb.maintenance.report import run_all
+        db = KBDB(layout.db_path)
+        await db.init()
+        return await run_all(db, layout, render_histories=not skip_histories)
+
+    report = asyncio.run(_run())
+
+    typer.echo("Maintenance complete.")
+    for key, value in sorted(report.counts.items()):
+        typer.echo(f"  {key:<32} {value}")
+    typer.echo(f"  histories_rendered               {report.histories_rendered}")
+    typer.echo(f"  health:   {report.health_path}")
+    typer.echo(f"  report:   {report.report_path}")
+    if report.errors:
+        typer.echo("\nErrors:", err=True)
+        for err in report.errors:
+            typer.echo(f"  - {err}", err=True)
+
+
+# Attach to the root app — done at import time by main.py
+app.add_typer(kb_app)

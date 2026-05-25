@@ -14,896 +14,347 @@
       '-+###############+-'
 
        S Y N T H A D O C
-    Community Edition  v0.2.0
   ────────────────────────────────
   Domain-agnostic LLM wiki engine
+   with a temporal fact tier on top
 ```
 
-[![CI](https://github.com/axoviq-ai/synthadoc/actions/workflows/ci.yml/badge.svg)](https://github.com/axoviq-ai/synthadoc/actions/workflows/ci.yml)
-[![Coverage](https://img.shields.io/badge/dynamic/json?url=https%3A%2F%2Fraw.githubusercontent.com%2Faxoviq-ai%2Fsynthadoc%2Fmain%2Fdocs%2Fbadges.json&query=%24.coverage&label=Coverage&suffix=%25&color=brightgreen)](https://github.com/axoviq-ai/synthadoc/actions/workflows/ci.yml)
-[![License](https://img.shields.io/badge/License-AGPL--3.0-blue.svg)](https://github.com/axoviq-ai/synthadoc/blob/main/LICENSE)
-[![Python](https://img.shields.io/badge/Python-3.11%2B-yellow.svg)](https://www.python.org/)
-[![Skills](https://img.shields.io/badge/dynamic/json?url=https%3A%2F%2Fraw.githubusercontent.com%2Faxoviq-ai%2Fsynthadoc%2Fmain%2Fdocs%2Fbadges.json&query=%24.skills&label=Skills&color=purple)](https://github.com/axoviq-ai/synthadoc/tree/main/synthadoc/skills)
-[![CLI](https://img.shields.io/badge/dynamic/json?url=https%3A%2F%2Fraw.githubusercontent.com%2Faxoviq-ai%2Fsynthadoc%2Fmain%2Fdocs%2Fbadges.json&query=%24.cli_commands&label=CLI%20commands&color=darkblue)](https://github.com/axoviq-ai/synthadoc)
-[![Obsidian](https://img.shields.io/badge/dynamic/json?url=https%3A%2F%2Fraw.githubusercontent.com%2Faxoviq-ai%2Fsynthadoc%2Fmain%2Fdocs%2Fbadges.json&query=%24.obsidian_commands&label=Obsidian%20commands&color=blueviolet)](https://github.com/axoviq-ai/synthadoc/tree/main/obsidian-plugin)
-[![Version](https://img.shields.io/badge/Community%20Edition-v0.2.0-orange.svg)](https://github.com/axoviq-ai/synthadoc)
+An LLM-driven engine that turns raw documents and meeting transcripts
+into a living, cross-referenced knowledge base. Local-first. Plain
+Markdown on disk. Two cooperating tiers:
 
-**Document version: v0.2.0**
+- **Page tier** (`wiki/`) — the user-facing wiki. Every ingest pass
+  decomposes a source into per-subject actions (create / update / flag),
+  with per-section provenance footers and contradiction surfacing. This
+  is the original Synthadoc and the artifact most users browse in
+  Obsidian.
+- **Temporal KB tier** (`kb/`, opt-in) — a parallel store of
+  timestamped, source-backed *facts*, *decisions*, and *unknowns*.
+  Pages here are **synthesized views** rendered from those facts, not
+  hand-edited. Asks like "what is the current status?" or "what
+  changed since 2026-05-01?" are answerable structurally, not via
+  context-window guessing.
 
-**An LLM-driven engine that compiles raw documents into a curated, cross-referenced Markdown wiki.**
-
-Synthadoc is a local-first CLI + HTTP server. It ingests PDFs, DOCX, PPTX, XLSX, images, web pages, YouTube transcripts, and meeting transcripts; runs each source through an LLM that decides which wiki pages to create, update, or flag; and emits [Obsidian](https://obsidian.md)-compatible Markdown with YAML frontmatter, `[[wikilinks]]`, and per-section provenance footers. Sources are decomposed by topic, so one meeting transcript can update multiple long-lived pages (project, person, open issue) in a single pass.
-
-The wiki is the artifact — stop the server and the folder is still a readable, editable knowledge base in any Markdown tool. Contradictions are surfaced rather than blended, orphan pages are flagged for linking, and every answer cites its sources.
-
----
-
-## What's Different in This Fork
-
-This is a downstream fork of [paulmchen/synthadoc](https://github.com/paulmchen/synthadoc), focused on turning Synthadoc into a living project / people / topic wiki driven by raw meeting transcripts. Changes layered on top of upstream:
-
-| Area | Change |
-| --- | --- |
-| **Multi-action ingest** | A single source fans out into one action per distinct subject. A meeting transcript can update the project page, the person page, and an open-issue page in a single pass. Date-prefixed and `meeting-with-…` slugs are rejected so meeting events never become first-class pages. |
-| **Source detail preservation** | The decision LLM sees the full source body, not a 3-sentence summary. Truncation caps raised to 30–40 KB end-to-end so a 40 KB transcript no longer collapses to a ~1 KB stub. The analysis pass is now purely entity/tag extraction for BM25 candidate search. |
-| **Provenance footers** | Every appended section ends with `_— Source: <label> · YYYY-MM-DD_`, parsed from the source filename when it starts with a date. Individual facts stay traceable as pages accumulate. |
-| **`synthadoc consolidate <slug>`** | New CLI command + `ConsolidateAgent` that rewrites an accumulated page into a curated, topic-organised form. Preserves every `[[wikilink]]` and provenance line verbatim, guards against shrinkage (configurable length floor) and data loss (wikilink/source-line set must be a subset of the rewrite), writes a pre-rewrite backup under `.synthadoc/consolidate-backups/`, and supports `--dry-run`. Idempotent — stamps `consolidated_hash` into frontmatter and skips re-runs when the body hasn't changed. |
-| **Subfolder layout** | Pages can live one level deep — `wiki/people/<slug>.md`, `wiki/projects/<slug>.md`, etc. The ingest LLM can pick a `folder` per `create` action; slugs stay globally unique so `[[wikilinks]]` resolve regardless of folder. Lint, scaffold, and the `/lint/report` endpoint walk the same tree. |
-| **Wiki context in queries** | `AGENTS.md` and `wiki/purpose.md` are threaded into the QueryAgent system prompt (previously only ingest saw them), so answers respect the wiki's audience and scope. |
-| **Worker timeout backstop** | Each job is wrapped in a 30-minute `asyncio.timeout`. A single hung provider call no longer wedges the entire backlog — the job fails, the queue keeps moving. Per-LLM-call `[agents] llm_timeout_seconds` remains the primary defense. |
-| **`purpose.md` size cap removed** | The 500-character cap on `purpose.md` is gone — write the full scope statement the LLM should respect. |
-
-The `CACHE_VERSION` has been bumped (now 7) so prior cached analyses and decisions made under upstream prompts are not reused.
+Stop the server and the folder is still a readable, editable knowledge
+base in any Markdown tool.
 
 ---
 
-## Who Is It For?
+## What's in this fork
 
-Synthadoc scales from a single researcher to a company-wide knowledge platform:
+Downstream of [paulmchen/synthadoc](https://github.com/paulmchen/synthadoc).
+The original engine — multi-action ingest with source decomposition,
+provenance footers, subfolder layout, `consolidate`, `scaffold`,
+contradiction detection — is intact. The fork adds the **Temporal KB
+tier** described in
+[`temporal_markdown_knowledge_base_spec.md`](temporal_markdown_knowledge_base_spec.md)
+and built per
+[`temporal_kb_implementation_plan.md`](temporal_kb_implementation_plan.md).
 
+| Area | What's new |
+|---|---|
+| Storage | `kb/sources`, `kb/source_summaries`, `kb/entities`, `kb/facts`, `kb/decisions`, `kb/unknowns`, `kb/maintenance`. SQLite index at `.synthadoc/kb.db`. |
+| IDs | Stable IDs like `source.meeting.2026-05-22.<slug>`, `fact.project.<slug>.project.status.2026-05-22`. Generators + validators in `synthadoc/kb/ids.py`. |
+| Pipeline | After every successful `synthadoc ingest`, a `kb_pipeline` job runs: SourceSummary → FactExtract → DecisionExtract → UnknownExtract → resolve → EntityRender. Best-effort, non-fatal — page-tier ingest is never blocked. |
+| Maintenance | `synthadoc kb maintenance run` → conflicts, stale pages, orphan facts, facts-without-evidence, conclusions-without-basis, duplicate entities, broken links, people-page §3.7 safety. Reports under `kb/maintenance/`. |
+| Determinism | Substring-quote guard on every extracted fact (paraphrased quotes are rejected without retry). Closed vocabularies for `entity_type` / `fact_type` / `authority` / `confidence` / `review_status`. Pure resolver with `latest_valid_at_wins` / `append_only` / `requires_review` strategies. |
+| Cost guard | `[ingest] max_tokens_per_fact_extract = N` caps runaway extraction per source. |
+| Telemetry | Per-maintenance-job OTel spans (`kb.maintenance.<name>`) land in `.synthadoc/logs/traces.jsonl`. |
+| CLI | `synthadoc kb {init, import-source, backfill, relink, maintenance run}`. |
 
-| Team size               | Typical use case                                                                                                                                                                                                                                                                                    |
-| ----------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| **Solo / 1–2 people**  | Personal research wiki, freelance knowledge base, indie hacker documentation - run it free on Gemini Flash or a local Ollama model with zero ongoing cost                                                                                                                                           |
-| **Small team (3–20)**  | Centralized internal knowledge base for startups and departments that aggregates diverse individual data sources into a unified, high-integrity wiki. The system automatically resolves contradictions and scales autonomously, ensuring organizational intelligence grows in tandem with your team |
-| **Medium / enterprise** | Compliance-sensitive knowledge bases that must stay local; per-department wikis on separate ports; audit trail for every ingest and cost event; hook system for CI/CD integration; OpenTelemetry for ops dashboards                                                                                 |
-
-No cloud account. No vendor lock-in. The wiki is plain Markdown — open it in any editor, back it up with git, sync it with any cloud drive.
-
----
-
-## Inspiration and Vision
-
-> *"The LLM should be able to maintain a wiki for you."*
-> — Andrej Karpathy, [LLM Wiki gist](https://gist.github.com/karpathy/442a6bf555914893e9891c11519de94f)
-
-Most knowledge-management tools retrieve and summarize at query time. Synthadoc inverts this: it **compiles knowledge at ingest time**. Every new source enriches and cross-links the entire corpus, not just appends a new chunk. The wiki is the artifact — readable, editable, and browsable without any tool running.
-
-**Long-term alignment:**
-
-
-| Direction                | How Synthadoc moves there                                                                                                                                                                                     |
-| ------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Agent orchestration      | Orchestrator dispatches parallel IngestAgent, QueryAgent, LintAgent sub-agents with cost guards and retry backoff                                                                                             |
-| Sub-agent skills/plugins | Featuring a 3-tier lazy-load capability system, the platform allows for the injection of custom skills and hooks via a plug-and-play interface, ensuring core stability is never compromised during extension |
-| LLM wiki vs. RAG         | Pre-compiled structured knowledge beats query-time synthesis for contradiction detection, graph traversal, and offline access                                                                                 |
-| CLI / HTTP               | A unified interface via CLI and RESTful endpoints, the system streamlines full-spectrum integration: from data ingestion and querying to automated linting, security auditing, and job orchestration          |
-| Local-first              | All data stays on your machine; localhost-only network binding; no cloud dependency except the LLM API itself                                                                                                 |
-| Provider choice          | LLM backends including free-tier Gemini and Groq, plus DeepSeek and MiniMax for cheapest paid text rates — no single-vendor dependency                                                                                    |
+A previous README is preserved at [`README.old.md`](README.old.md) for
+historical context.
 
 ---
 
-## Problems Addressed
+## Mental model
 
-### 1. RAG conflates contradictions; Synthadoc surfaces them
+```
+                       ┌──────────────────────┐
+                       │   synthadoc ingest   │
+                       │       <source>       │
+                       └──────────┬───────────┘
+                                  │
+                ┌─────────────────┼─────────────────┐
+                ▼                                   ▼
+   ┌──────────────────────┐         ┌──────────────────────────┐
+   │   PAGE TIER (always) │         │  KB TIER (if initialised)│
+   ├──────────────────────┤         ├──────────────────────────┤
+   │ IngestAgent          │         │ kb_pipeline job          │
+   │  fan-out by subject  │         │  ├── SourceSummaryAgent  │
+   │  → wiki/<slug>.md    │         │  ├── FactExtractAgent    │
+   │  + provenance footer │         │  ├── DecisionExtractAgent│
+   │  + contradictions    │         │  ├── UnknownExtractAgent │
+   │                      │         │  ├── resolve_db          │
+   └──────────────────────┘         │  └── EntityRenderAgent   │
+                                    │     → kb/entities/…/.md  │
+                                    └──────────────────────────┘
 
-When two sources disagree, vector search returns both and the LLM silently blends them. Synthadoc detects the conflict during ingest, flags the page with `status: contradicted`, preserves both claims with citations, and either auto-resolves (if confidence ≥ threshold) or queues the conflict for human review.
+           Periodic: `synthadoc kb maintenance run`
+           ↳ conflict / stale / evidence / dup / link / safety reports
+           ↳ history.md re-render per entity
+           ↳ kb_health.md snapshot + archived copy
+```
 
-### 2. Knowledge fragments; Synthadoc links it
-
-RAG chunks are isolated. Synthadoc builds `[[wikilinks]]` between related pages during every ingest pass. The resulting graph is visible in Obsidian's Graph view and queryable with Dataview.
-
-### 3. Orphan knowledge has no address; Synthadoc finds it
-
-Pages that exist but are referenced by nothing are surfaced by the lint system, with ready-to-paste index entries so you can quickly integrate them.
-
-### 4. Re-synthesis is expensive; Synthadoc caches it
-
-A 3-layer cache (embedding, LLM response, provider prompt cache) means repeated lint runs on unchanged pages cost near-zero tokens.
-
-### 5. Knowledge is locked in tools; Synthadoc escapes it
-
-Every page is a plain Markdown file with YAML frontmatter. No proprietary format. Open the folder in any editor, put it in git, sync it with any cloud drive.
-
-### 6. Wiki structure decays as content grows; Synthadoc regenerates it
-
-As the wiki accumulates pages the `index.md` table of contents, domain scope (`purpose.md`), and LLM behaviour guidelines (`AGENTS.md`) can drift out of sync with actual content. The `scaffold` command re-generates all three from the current wiki state using the LLM — creating category-aware index entries, refreshed scope boundaries, and updated terminology guidelines — without touching pages already linked in the index. Run it once after initial install to get a rich scaffold, then schedule it weekly as the wiki grows.
-
-### Business values
-
-
-| Value                 | How                                                                                 |
-| --------------------- | ----------------------------------------------------------------------------------- |
-| **Faster onboarding** | New team members query the wiki instead of digging through documents                |
-| **Audit trail**       | Every ingest recorded in`audit.db` with source hash, token count, and timestamp     |
-| **Cost control**      | Configurable soft-warn and hard-gate thresholds; 3-layer cache reduces repeat spend |
-| **Compliance**        | Local-first — source documents and compiled knowledge never leave your machine     |
-| **Extensibility**     | Hooks fire on every event; custom skills load without a server restart              |
+The fact tier is **strictly opt-in.** A wiki without
+`synthadoc kb init` behaves exactly like the v0.2 page-tier engine —
+no `kb/` folder, no `kb.db`, no parallel pipeline.
 
 ---
 
-## Why Synthadoc?
-
-### Competitive advantages
-
-
-| Capability                   | Synthadoc                                                      | Typical RAG | NotebookLM | Notion AI |
-| ---------------------------- | -------------------------------------------------------------- | ----------- | ---------- | --------- |
-| Ingest-time synthesis        | **Yes**                                                        | No          | Partial    | No        |
-| Contradiction detection      | **Yes**                                                        | No          | No         | No        |
-| Orphan page detection        | **Yes**                                                        | No          | No         | No        |
-| Persistent wikilink graph    | **Yes**                                                        | No          | No         | No        |
-| Local-first (no cloud data)  | **Yes**                                                        | Varies      | No         | No        |
-| Custom skill plugins         | **Yes**                                                        | Limited     | No         | No        |
-| Obsidian integration         | **Yes**                                                        | No          | No         | No        |
-| Cost guard + audit trail     | **Yes**                                                        | No          | No         | No        |
-| Hook / CI integration        | **Yes** (2 events)                                             | No          | No         | No        |
-| Offline browsable artifact   | **Yes**                                                        | No          | No         | No        |
-| Multi-wiki isolation         | **Yes**                                                        | No          | No         | No        |
-| Web search → wiki pages     | **Yes**                                                        | No          | No         | No        |
-| Multiple LLMs support       | **Yes** (Gemini, Groq, MiniMax, DeepSeek, Anthropic, OpenAI, Ollama) | No          | No         | No        |
-| Auto wiki overview page      | **Yes**                                                        | No          | No         | No        |
-| Resumable job queue + retry  | **Yes**                                                        | No          | No         | No        |
-| Query decomposition          | **Yes** (parallel sub-queries)                                 | No          | No         | No        |
-| Knowledge gap detection      | **Yes**                                                        | No          | No         | No        |
-| Web search decomposition     | **Yes** (parallel Tavily)                                      | No          | No         | No        |
-| Semantic re-ranking (vector) | **Yes** (optional fastembed)                                   | Varies      | No         | No        |
-| Scaffold automation          | **Yes**                                                        | No          | No         | No        |
-
-### Key differentiators vs. RAG
-
-RAG chunks documents and retrieves them at query time. Synthadoc **compiles** knowledge: every new source is synthesized into the existing wiki graph at ingest time.
-
-- **Contradictions are caught, not blended.** When two sources disagree, Synthadoc flags the page — RAG silently averages both claims.
-- **Knowledge is linked, not scattered.** `[[wikilinks]]` connect related pages into a navigable graph visible in Obsidian and queryable with Dataview.
-- **The artifact outlives the tool.** Close the server, open the wiki folder in any Markdown editor — the knowledge is all there, human-readable, no proprietary format.
-- **Cost-efficient at scale.** Two-step ingest with cached analysis means repeated ingest of similar sources costs near-zero tokens. Three cache layers stack for lint and query too.
-- **Ingest is durable, not fragile.** Every ingest request becomes a queued job with automatic retry and a persistent audit record. Batch a hundred documents and resume after a crash — no work is lost.
-
----
-
-## Architecture
-
-![Synthadoc Architecture](docs/png/architecture.png)
-
-For full architecture details, data models, API reference, and plugin development guide see **[docs/design.md](docs/design.md)**.
-
----
-
-## Features
-
-### Ingest, synthesis, retrieval
-
-- **Multi-format ingest** — PDF, DOCX, PPTX, XLSX/CSV, Markdown, TXT, images (via vision-capable LLMs), HTML/URLs, YouTube transcripts. Pluggable via `BaseSkill` subclasses dropped in `~/.synthadoc/skills/` or `<wiki>/skills/`.
-- **Two-pass ingest** — entity/tag extraction for BM25 candidate search, then a per-subject decision LLM that fans out into one action (`create` / `update` / `flag`) per distinct subject in the source.
-- **Source decomposition** — a single mixed-subject source produces one action per long-lived page. A meeting transcript covering a project, two people, and an open issue produces four actions, one updating each page.
-- **Provenance footers** — every appended section ends with `_— Source: <label> · YYYY-MM-DD_` so individual facts stay traceable as pages accumulate.
-- **Subfolder layout** — pages can live one level deep (`wiki/people/`, `wiki/projects/`); slugs stay globally unique so `[[wikilinks]]` resolve regardless of folder.
-- **BM25 + optional vector re-ranking** — keyword search by default; opt in to `fastembed` + `BAAI/bge-small-en-v1.5` cosine re-ranking with `[search] vector = true`.
-- **Query decomposition** — compound questions split into parallel BM25 sub-queries, then merged before synthesis.
-- **Web ingest** — Tavily-backed `search for: …` jobs with parallel sub-search decomposition. YouTube URLs are routed to transcript extraction automatically.
-
-### Wiki maintenance
-
-- **Contradiction detection** — pages with `status: contradicted` are surfaced by `lint`; high-confidence resolutions are auto-applied, others queue for human review.
-- **Orphan detection** — pages referenced by no other content page are flagged with ready-to-paste index entries.
-- **`scaffold`** — regenerates `index.md`, `purpose.md`, and `AGENTS.md` from current wiki content; never touches pages already linked in the index. Idempotent across runs.
-- **`consolidate`** — rewrites an accumulated page (e.g. a project page with 20 meetings appended) into curated, topic-organised form. Hard safeguards: every `[[wikilink]]` and `_— Source:_` line must survive; the rewrite cannot shrink below `before × 0.5`; pre-rewrite content is backed up under `.synthadoc/consolidate-backups/`. Idempotent via `consolidated_hash` in frontmatter, with `--dry-run` and `--force`.
-
-### LLM providers
-
-- **Seven backends wired in** — Anthropic, OpenAI, Gemini, Groq, DeepSeek, MiniMax, Ollama (local). Per-agent role override (ingest / query / lint / skill / scaffold / default) in `[agents]` config.
-- **Custom providers** — subclass `LLMProvider`, drop in `~/.synthadoc/providers/`, hot-load.
-
-### Operations
-
-- **Persistent job queue** — SQLite-backed (`jobs.db`); states `pending` → `in_progress` → `completed` / `failed` / `dead` / `skipped`. Configurable retries; 30-minute per-job `asyncio.timeout` backstop; automatic recovery of in-flight jobs after a crash.
-- **3-layer cache** — embedding store, LLM-response cache (`cache.db`, versioned key), and provider-level prompt cache. `CACHE_VERSION` bump invalidates everything cached under stale prompts.
-- **Audit trail** — `audit.db` records every ingest (source hash, token count, cost, timestamp), every audit event (contradictions, auto-resolves, cost gates), and every query.
-- **Cost guards** — soft-warn and hard-gate token thresholds per operation.
-- **OpenTelemetry** — traces to local JSONL by default; flip to OTLP for Jaeger / Tempo / Honeycomb / Datadog.
-- **Hooks** — shell commands fire on `on_ingest_complete` / `on_lint_complete` with JSON context on stdin; `blocking = true` gates the operation on hook exit code.
-- **Multi-wiki isolation** — each wiki has its own folder, port, config, queue, cache, and audit log; `synthadoc use <name>` sets the default.
-- **Scheduler** — cron-style schedules via `synthadoc schedule add` for recurring ingest / lint / scaffold.
-
-### Interfaces
-
-- **CLI** — `install`, `use`, `serve`, `ingest`, `query`, `lint`, `consolidate`, `scaffold`, `jobs`, `audit`, `cache`, `schedule`, `status`, `uninstall`.
-- **HTTP API** — FastAPI on the per-wiki port; endpoints for `/health`, `/status`, `/query`, `/analyse`, `/jobs/*`, `/consolidate`, `/lint/report`.
-- **Obsidian plugin** — ingest-current-file, ingest-all-sources, query, jobs list, lint report, ingest-from-URL, web-search, lint, lint-auto-resolve.
-
-### Output format
-
-Plain Markdown + YAML frontmatter (`title`, `tags`, `status`, `confidence`, `sources`, `created`, `orphan`, `categories`, `consolidated_hash`). Wikilinks as `[[slug]]`. Readable in any editor, browsable in Obsidian Graph view, queryable with Dataview. No proprietary format, no database lock-in — back it up with git, sync it with any cloud drive.
-
-For the per-version release history see [docs/design.md — Appendix A: Release Feature Index](docs/design.md#appendix-a--release-feature-index).
-
----
-
-## Installation
-
-### Prerequisites
-
-
-| Requirement    | Version | Notes                               |
-| -------------- | ------- | ----------------------------------- |
-| Python         | 3.11+   |                                     |
-| Node.js        | 18+     | Obsidian plugin build only          |
-| Git            | any     |                                     |
-| LLM API key    | —      | At least one required (see below)   |
-| Tavily API key | —      | Optional — web search feature only |
-
-**LLM API key — at least one required:**
-
-
-| Provider         | Free tier                                     | Vision          | Get key                                                       |
-| ---------------- | --------------------------------------------- | --------------- | ------------------------------------------------------------- |
-| **Gemini Flash** | Yes — 15 RPM / 1M tokens/day, no credit card | Yes             | [aistudio.google.com](https://aistudio.google.com/app/apikey) |
-| Groq             | Yes — rate-limited                           | No              | [console.groq.com](https://console.groq.com/keys)             |
-| Ollama           | Yes — runs locally, no key                   | Model-dependent | [ollama.com](https://ollama.com)                              |
-| MiniMax          | No — pay-per-token                           | Yes             | [platform.minimax.io](https://platform.minimax.io/)           |
-| DeepSeek         | No — pay-per-token (very cheap text rates)   | No              | [platform.deepseek.com](https://platform.deepseek.com/api_keys) |
-| Anthropic        | No                                            | Yes             | [console.anthropic.com](https://console.anthropic.com/)       |
-| OpenAI           | No                                            | Yes             | [platform.openai.com](https://platform.openai.com/api-keys)   |
-
-**Tavily API key (optional — enables web search):**
-Get a free key at [tavily.com](https://tavily.com). Without it, web search jobs will fail but all other features work normally.
-
----
-
-### Step 1 — Clone and install
+## Quick start (page tier only)
 
 ```bash
-git clone https://github.com/paulmchen/synthadoc.git
+# Install
+git clone https://github.com/axoviq-ai/synthadoc.git
 cd synthadoc
 pip3 install -e ".[dev]"
-```
 
-### Step 2 — Run the Python test suite
+# Set at least one LLM API key (Gemini Flash is free-tier and the default)
+export GEMINI_API_KEY=AIza…      # macOS/Linux
+$env:GEMINI_API_KEY = "AIza…"    # PowerShell
 
-Validate that the Python engine builds and all tests pass before proceeding:
-
-```bash
-pytest --ignore=tests/performance/ -q
-```
-
-Expected: all tests pass, 0 failures. If any fail, check the error output before continuing.
-
-Performance benchmarks (optional — Linux/macOS, measures SLOs):
-
-```bash
-pytest tests/performance/ -v --benchmark-disable
-```
-
-### Step 3 — Build and test the Obsidian plugin
-
-```bash
-cd obsidian-plugin
-npm install
-npm run build    # produces main.js
-npm test         # runs Vitest unit tests
-```
-
-### Step 4 — Set your API keys
-
-**At least one LLM API key is required** — Synthadoc will not start without one.
-
-Synthadoc defaults to **Gemini Flash** as the LLM provider — it's free, requires no
-credit card, and offers 1 million tokens per day. Get a key at
-**aistudio.google.com/app/apikey** (click "Create API key").
-
-Web search uses **Tavily** (`TAVILY_API_KEY`) — optional, only needed for
-`synthadoc ingest "search for: …"` jobs.
-
-```bash
-# macOS / Linux — add to ~/.bashrc or ~/.zshrc to persist
-export GEMINI_API_KEY=AIza…          # default — free tier, 1M tokens/day
-export GROQ_API_KEY=gsk_…            # alternative free tier — 100K tokens/day
-export ANTHROPIC_API_KEY=sk-ant-…    # paid — highest quality
-export MINIMAX_API_KEY=…             # paid — text rates (image support)
-export DEEPSEEK_API_KEY=…            # paid — text rates (no image support)
-export TAVILY_API_KEY=tvly-…         # web search (optional)
-
-# Windows cmd — current session only
-set GEMINI_API_KEY=AIza…
-set GROQ_API_KEY=gsk_…
-set ANTHROPIC_API_KEY=sk-ant-…
-set MINIMAX_API_KEY=…
-set DEEPSEEK_API_KEY=…
-set TAVILY_API_KEY=tvly-…
-
-# Windows cmd — permanent (open a new cmd window after running)
-setx GEMINI_API_KEY AIza…
-setx GROQ_API_KEY gsk_…
-setx ANTHROPIC_API_KEY sk-ant-…
-setx MINIMAX_API_KEY …
-setx DEEPSEEK_API_KEY sk-…
-setx TAVILY_API_KEY tvly-…
-```
-
-To switch provider, edit `[agents]` in `<wiki-root>/.synthadoc/config.toml` and restart
-`synthadoc serve`. See [Appendix — Switching LLM providers](docs/user-quick-start-guide.md#appendix-c--switching-llm-providers) for step-by-step instructions.
-
-### Step 5 — Verify
-
-```bash
-synthadoc --version
-```
-
-### Step 6 — Install a demo wiki, then start the engine
-
-A **wiki** is a self-contained, structured knowledge base — a folder of Markdown pages linked by topic, maintained and cross-referenced automatically by Synthadoc. Think of it as a living document that grows smarter with every source you feed it: each ingest pass adds new pages, updates existing ones, and flags contradictions. For your own work, you can build and grow a domain-specific wiki — whether that's market research, a technical knowledge base, or a team handbook — and query it in plain English or other languages at any time.
-
-A wiki must be installed before the engine can serve it. The fastest way to get started is the **History of Computing** demo, which ships with 10 pre-built pages and sample source files — no LLM API key required to browse it.
-
-**Install the demo wiki:**
-
-```bash
-# Linux / macOS
+# Install a demo wiki
 synthadoc install history-of-computing --target ~/wikis --demo
-
-# Windows (cmd.exe)
-synthadoc install history-of-computing --target %USERPROFILE%\wikis --demo
-```
-
-**Then start the engine:**
-
-```bash
-# Foreground — keeps the terminal; logs stream to the console
 synthadoc serve -w history-of-computing
-
-# Background — releases the terminal; logs go to the wiki log file
-synthadoc serve -w history-of-computing --background
+# → http://127.0.0.1:7070
 ```
 
-The server binds to `http://127.0.0.1:7070` by default (port is set in `<wiki-root>/.synthadoc/config.toml`). Leave it running while you work — the Obsidian plugin, CLI ingest commands, and query commands all talk to it.
+The demo ships with pre-built pages and sample sources. Walk through
+[`docs/user-quick-start-guide.md`](docs/user-quick-start-guide.md)
+for a full tour — installing the Obsidian plugin, running queries,
+batch ingesting, resolving contradictions, fixing orphans.
 
-To stop a background server:
-
-```bash
-# Linux / macOS
-kill <PID>
-
-# Windows (cmd)
-taskkill /PID <PID> /F
-```
-
-The PID is printed when the background server starts and saved to `<wiki-root>/.synthadoc/server.pid`.
-
----
-
-## Quick-Start Guide
-
-The **History of Computing** demo includes 13 pre-built pages, raw source files covering clean-merge, contradiction, and orphan scenarios, and a full walkthrough of key Synthadoc feature.
-
-**Full step-by-step walkthrough: [docs/user-quick-start-guide.md](docs/user-quick-start-guide.md)**
-
-The guide covers:
-
-1. Verify the demo server started (banner, health check)
-2. Install Dataview in Obsidian
-3. Install the Synthadoc plugin and open the vault
-4. Review wiki structure and key files (index, purpose, AGENTS.md, dashboard)
-5. Query the pre-built wiki — including knowledge gap detection
-6. Batch ingest all demo source files
-7. Resolve a contradiction
-8. Fix an orphan page
-9. Web search ingestion with automatic decomposition
-10. Enrich the wiki with scaffold (regenerate/update index, purpose, AGENTS.md)
-11. Audit features (token cost, history, events)
-12. Schedule recurring operations
-
----
-
-## Creating Your Own Wiki
-
-Unlike the demo (which ships with pre-built pages), your own wiki starts from a domain description and grows as you feed it sources. Three commands are all you need to get started:
+To start a wiki from scratch:
 
 ```bash
-synthadoc install market-condition-canada --target ~/wikis --domain "Market conditions and trends in Canada"
-synthadoc use market-condition-canada   # set as the default wiki — no -w needed from here on
+synthadoc install my-research --target ~/wikis \
+   --domain "Market conditions and trends in Canada"
+synthadoc use my-research
 synthadoc serve
 ```
 
-`--domain` is a free-text description of the subject area — the LLM uses it to generate four domain-aware starter files via scaffold:
+---
 
+## Adopting the Temporal KB tier
 
-| File                | Purpose                                                                     |
-| ------------------- | --------------------------------------------------------------------------- |
-| `wiki/index.md`     | Table of contents — domain-relevant categories with`[[wikilinks]]`         |
-| `wiki/purpose.md`   | Scope declaration — tells the ingest agent what belongs and what to ignore |
-| `AGENTS.md`         | LLM behaviour guidelines — tone, terminology, and synthesis style          |
-| `wiki/dashboard.md` | Live Dataview dashboard — orphan pages, contradictions, page count         |
-
-Open the wiki folder in Obsidian as a new vault and install both the Dataview and Synthadoc plugins (required once per wiki). The Quick-Start Guide covers this setup in detail — see [docs/user-quick-start-guide.md](docs/user-quick-start-guide.md).
-
-**Recommended growth loop:**
-
-**1. Seed with web searches** — pull in real content for the topics you care about:
+On any existing wiki:
 
 ```bash
-synthadoc ingest "search for: Economy, employment and labour market analysis in Toronto GTA"
-synthadoc ingest "search for: Bank of Canada interest rate outlook 2025"
-synthadoc jobs list   # watch progress
+synthadoc kb init -w my-wiki              # creates kb/ + kb.db + kb_config.yaml
+synthadoc kb backfill -w my-wiki          # seeds sources from existing audit history
+
+# From here on every `synthadoc ingest` also runs the kb pipeline.
+synthadoc ingest path/to/source.md -w my-wiki
+
+# Periodic maintenance
+synthadoc kb maintenance run -w my-wiki
 ```
 
-Each search fans out into up to 20 parallel URL ingest jobs. Query decomposition and web search decomposition (see below) make broad topics yield much richer results than a single search.
+That's it. The kb pipeline runs as a queue job on the existing
+worker, retries on transient failure via the same machinery as
+ingest/lint, and surfaces telemetry in the same traces.jsonl.
 
-**2. Lint and query** — check for contradictions and verify the wiki answers your questions:
+For a step-by-step soak-test playbook on a real wiki (with
+inspection checklists, failure-mode triage, rollback) see
+[`docs/temporal-kb-soak-test.md`](docs/temporal-kb-soak-test.md).
+
+For the full user guide — workflows, frontmatter reference, resolution
+rules, per-role provider config, troubleshooting, architecture pointers
+— see [`docs/temporal-kb.md`](docs/temporal-kb.md).
+
+---
+
+## Command reference
+
+### Page tier (unchanged from upstream)
 
 ```bash
-synthadoc lint run
-synthadoc lint report
-synthadoc query "What are the current employment trends in the Toronto GTA?"
+synthadoc install <name> --target <dir> [--demo | --domain "..."]
+synthadoc use [<name> | --clear]
+synthadoc serve -w <name> [--background] [--port N]
+synthadoc ingest <file-or-url> -w <name> [--force] [--batch <dir>] [--file <manifest>]
+synthadoc query "..." -w <name> [--save]
+synthadoc lint run [--scope contradictions] [--auto-resolve] -w <name>
+synthadoc lint report -w <name>
+synthadoc consolidate <slug> [--dry-run] [--force] -w <name>
+synthadoc scaffold -w <name>                  # re-generates index / AGENTS.md / purpose.md
+synthadoc jobs {list, status, retry, cancel, purge} -w <name>
+synthadoc audit {history, cost, events} -w <name>
+synthadoc schedule {add, list, remove, apply} -w <name>
+synthadoc cache clear -w <name>
+synthadoc status -w <name>
 ```
 
-**3. Re-run scaffold** — after pages accumulate, scaffold regenerates a richer index that reflects actual content. Pages already linked in `index.md` are never overwritten:
+### Temporal KB tier (this fork)
 
 ```bash
-synthadoc scaffold
+synthadoc kb init -w <name>
+synthadoc kb import-source <file> --type meeting_transcript|document|email|deck|note -w <name>
+synthadoc kb backfill [--dry-run] -w <name>
+synthadoc kb relink -w <name>                 # rebuild links table after manual edits
+synthadoc kb maintenance run [--skip-histories] -w <name>
 ```
 
-**4. Schedule recurring updates** — keep the wiki fresh automatically:
+---
 
-```bash
-synthadoc schedule add --op "ingest" --source "search for: Toronto GTA economic indicators latest" --cron "0 2 * * *"
-synthadoc schedule add --op "scaffold" --cron "0 4 * * 0"
-```
+## What the temporal tier gives you
 
-### How decomposition works
+Concretely, for each ingested source you get:
 
-Synthadoc decomposes complex inputs into focused sub-tasks at three points:
+- **One source summary**, bounded to that source's own content.
+- **Zero-or-more atomic facts** — each tied to one entity, one
+  `fact_type`, one `valid_at` date, with a verbatim source quote.
+  Closed vocab for `fact_type` (e.g. `project.status`, `project.owner`,
+  `decision.made`); paraphrased quotes are rejected automatically.
+- **Zero-or-more decisions** — explicit commitments only, with date /
+  authority / source-quote.
+- **Zero-or-more unknowns** — explicit gaps the source raises but
+  doesn't resolve.
+- **Rendered entity index pages** — current-state view computed from
+  the resolver. Re-renders on every pipeline run unless the entity is
+  marked `current_state_review_status: reviewed`, in which case
+  proposed changes accumulate in `kb/maintenance/review_queue.md`.
+- **Rendered history pages** — chronological fact log per entity,
+  including superseded facts as evidence of historical state.
 
-- **Query decomposition** — a compound question becomes multiple BM25 retrievals merged before synthesis.
-- **Web search decomposition** — a broad search topic becomes multiple focused Tavily keyword searches whose results are merged and deduplicated.
-- **Source decomposition (this fork)** — a single source becomes one ingest action per distinct subject. A meeting transcript covering a project, two people, and an open issue produces four actions — one updating each long-lived page — rather than a single create or update.
-
-All three fall back gracefully if the LLM decomposition call fails.
-
-See [docs/design.md — Query decomposition and web search decomposition](docs/design.md#query-decomposition) for the full design.
-
-### Semantic re-ranking (vector search)
-
-BM25 keyword search is the default. Optional vector re-ranking (`BAAI/bge-small-en-v1.5` cosine similarity) improves recall on conceptually related queries — enable it by installing `fastembed` and setting `[search] vector = true` in config. The ~130 MB model is downloaded once; BM25 stays active as fallback.
-
-See [docs/design.md — Semantic re-ranking](docs/design.md#semantic-re-ranking) for configuration options and performance notes.
-
-### Knowledge gap workflow
-
-When a query returns thin or empty results, the wiki doesn't yet cover the topic. Fill the gap with a targeted web search ingest, wait for jobs, then re-query. Each ingest cycle makes the wiki denser — future queries need the web less.
-
-See [docs/design.md — Knowledge gap workflow](docs/design.md#knowledge-gap-workflow) for the full pattern.
-
-See [docs/design.md](docs/design.md) for a full description of how ingest, contradiction detection, and orphan tracking work under the hood.
+Plus the maintenance reports under `kb/maintenance/` (conflicts,
+stale pages, orphan facts, facts without evidence, conclusions without
+basis, duplicate entity candidates, broken links, people-page safety
+flags, `kb_health.md` snapshot, timestamped archives).
 
 ---
 
 ## Configuration
 
-You do not need to configure anything to run the demo. The demo wiki ships with its own settings and sensible built-in defaults cover everything else. Set your API key env var, run `synthadoc serve`, and go.
-
-For the full configuration reference — layer precedence, global vs. per-project config, all keys and defaults — see [Appendix E — Configuration](docs/user-quick-start-guide.md#appendix-e--configuration) in the Quick-Start Guide, or [docs/design.md — Configuration](docs/design.md#configuration) for the complete technical reference.
-
----
-
-## Command Reference by Use Case
-
-### Setting up a wiki
-
-```bash
-# Create a new empty wiki (LLM scaffold runs automatically if API key is set)
-synthadoc install my-wiki --target ~/wikis --domain "Machine Learning"
-
-# Create a wiki on a specific port (useful when running multiple wikis)
-synthadoc install my-wiki --target ~/wikis --domain "Machine Learning" --port 7071
-
-# Install the demo (includes pre-built pages and raw sources — no LLM call needed)
-synthadoc install history-of-computing --target ~/wikis --demo
-
-# List available demo templates
-synthadoc demo list
-```
-
-### Switching the active wiki
-
-```bash
-# Set a wiki as the default so -w is not required for any subsequent command
-synthadoc use my-wiki
-
-# Check which wiki is currently active
-synthadoc use
-
-# Clear the saved default (revert to requiring -w on every command)
-synthadoc use --clear
-```
-
-### Refreshing wiki scaffold
-
-After install, you can re-run the LLM scaffold at any time to regenerate domain-specific content (index categories, AGENTS.md guidelines, purpose.md scope). Pages already linked in `index.md` are protected and preserved.
-
-```bash
-# Regenerate scaffold for an existing wiki
-synthadoc scaffold -w my-wiki
-
-# Schedule weekly refresh (runs every Sunday at 4 AM)
-synthadoc schedule add --op "scaffold" --cron "0 4 * * 0" -w my-wiki
-```
-
-`config.toml` and `dashboard.md` are never modified by `scaffold`.
-
-### Running the server
-
-```bash
-# Start HTTP API + job worker (foreground — terminal stays attached)
-synthadoc serve -w my-wiki
-
-# Detach to background — banner shown, then shell is released
-# All logs go to <wiki>/.synthadoc/logs/synthadoc.log
-synthadoc serve -w my-wiki --background
-
-# Custom port
-synthadoc serve -w my-wiki --port 7071
-
-# Verbose debug logging to console
-synthadoc serve -w my-wiki --verbose
-```
-
-### Ingesting sources
-
-```bash
-# Single file or URL
-synthadoc ingest report.pdf -w my-wiki
-synthadoc ingest https://example.com/article -w my-wiki
-
-# Entire folder (parallel, up to max_parallel_ingest at a time)
-synthadoc ingest --batch raw_sources/ -w my-wiki
-
-# Manifest file — ingest a curated list of sources in one shot.
-# sources.txt: one entry per line; each line is either an absolute file path
-# (PDF, DOCX, PPTX, MD, …) or a URL. Blank lines and # comments are ignored.
-# Each entry becomes a separate job in the queue, processed sequentially.
-#
-# Example sources.txt:
-#   /home/user/docs/research-paper.pdf
-#   /home/user/slides/keynote.pptx
-#   https://en.wikipedia.org/wiki/Alan_Turing
-#   # this line is ignored
-synthadoc ingest --file sources.txt -w my-wiki
-
-# Force re-ingest (bypass deduplication and cache)
-synthadoc ingest --force report.pdf -w my-wiki
-
-# Web search — triggers a Tavily search, then ingests each result URL as a child job.
-# Prefix the query with any recognised intent: "search for:", "find on the web:",
-# "look up:", or "web search:"  (prefix is stripped before the search is sent)
-# Requires TAVILY_API_KEY to be set.
-#
-# Note: web search content is NOT saved to raw_sources/. The flow is direct:
-#   query → Tavily → URLs → each URL fetched → wiki pages written
-# raw_sources/ is for user-provided local files (PDF, DOCX, PPTX, etc.) only.
-# The wiki pages themselves are the persistent output of a web search.
-synthadoc ingest "search for: Bank of Canada interest rate decisions 2024" -w my-wiki
-synthadoc ingest "find on the web: unemployment trends Ontario Q1 2025" -w my-wiki
-
-# Limit how many URLs are enqueued (default 20, overrides [web_search] max_results)
-synthadoc ingest "search for: quantum computing basics" --max-results 5 -w my-wiki
-
-# Multiple web searches at once via a manifest file
-# web-searches.txt:
-#   search for: Bank of Canada interest rate decisions 2024
-#   find on the web: unemployment trends Ontario Q1 2025
-#   look up: Toronto housing market affordability index
-synthadoc ingest --file web-searches.txt -w my-wiki
-
-# YouTube video — transcript extracted automatically, no API key needed.
-# The video must have captions (auto-generated or manual).
-# Check: open the video on YouTube → ... → Show transcript.
-synthadoc ingest "https://www.youtube.com/watch?v=O5nskjZ_GoI" -w my-wiki
-synthadoc ingest "https://youtu.be/O5nskjZ_GoI" -w my-wiki
-
-# YouTube URLs returned by web search are also routed automatically:
-# if Tavily returns a YouTube URL, the transcript is ingested instead of the page HTML.
-synthadoc ingest "search for: history of computing lecture" -w my-wiki
-```
-
-Each YouTube wiki page opens with an **executive summary** — what the video is about,
-the main topics covered, and the key takeaway — followed by the full timestamped transcript
-for precise citation.
-
-### Querying
-
-```bash
-# Ask a question — answer cites wiki pages
-synthadoc query "What is Moore's Law?" -w my-wiki
-
-# Save the answer as a new wiki page
-synthadoc query "What is Moore's Law?" --save -w my-wiki
-```
-
-### Linting
-
-```bash
-# Run a full lint pass (enqueues job)
-synthadoc lint run -w my-wiki
-
-# Only contradictions
-synthadoc lint run --scope contradictions -w my-wiki
-
-# Auto-apply high-confidence resolutions
-synthadoc lint run --auto-resolve -w my-wiki
-
-# Instant report (reads wiki files directly, no server needed)
-synthadoc lint report -w my-wiki
-```
-
-### Consolidating accumulated pages
-
-Pages that grow via repeated ingest appends (a project page that has accumulated sections from twenty meetings, say) can be rewritten into a curated, topic-organised form. `ConsolidateAgent` preserves every `[[wikilink]]` and `_— Source:_` provenance line, deduplicates facts across sections, and refuses to write if any of its safety guards trip.
-
-```bash
-# Preview the rewrite without touching the page
-synthadoc consolidate project-egp --dry-run -w my-wiki
-
-# Run it for real — pre-rewrite body is backed up under
-# .synthadoc/consolidate-backups/<slug>-<UTC-timestamp>.md
-synthadoc consolidate project-egp -w my-wiki
-
-# Re-running on an unchanged page is a no-op (frontmatter records the
-# content hash at last consolidation). Pass --force to override.
-synthadoc consolidate project-egp --force -w my-wiki
-```
-
-Safeguards (each raises and leaves the page untouched if they trip):
-
-- Wikilink preservation — the set of `[[slug]]` before must be a subset of after.
-- Source preservation — every `(label, date)` from `_— Source: …_` lines must survive.
-- Length floor — the rewrite cannot shrink the page below `before × 0.5` (configurable), catching over-summarisation.
-- Provenance footers cannot all be dropped.
-
-### Monitoring jobs
-
-```bash
-# List all jobs (most recent first)
-synthadoc jobs list -w my-wiki
-
-# Filter by status
-synthadoc jobs list --status pending -w my-wiki
-synthadoc jobs list --status failed -w my-wiki
-synthadoc jobs list --status dead -w my-wiki
-
-# Single job detail
-synthadoc jobs status <job-id> -w my-wiki
-
-# Retry a dead job
-synthadoc jobs retry <job-id> -w my-wiki
-
-# Cancel all pending jobs at once (e.g. after a bad batch ingest)
-synthadoc jobs cancel -w my-wiki        # prompts for confirmation
-synthadoc jobs cancel --yes -w my-wiki  # skip confirmation
-
-# Remove old records
-synthadoc jobs purge --older-than 30 -w my-wiki
-```
-
-### Inspecting ingest results
-
-```bash
-# Preview how a source will be analysed without writing pages
-synthadoc ingest report.pdf --analyse-only -w my-wiki
-# → {"entities": [...], "tags": [...], "summary": "..."}
-```
-
-### Audit trail
-
-```bash
-# Ingest history: timestamp, source file, wiki page, tokens, cost
-synthadoc audit history -w my-wiki            # last 50 records
-synthadoc audit history -n 100 -w my-wiki     # last 100 records
-synthadoc audit history --json -w my-wiki     # raw JSON for scripting
-
-# Token usage: totals + daily breakdown (cost always $0.0000 in v0.1)
-synthadoc audit cost -w my-wiki               # last 30 days
-synthadoc audit cost --days 7 -w my-wiki      # last 7 days
-
-# Audit events: contradictions found, auto-resolutions, cost gate triggers
-synthadoc audit events -w my-wiki             # last 100 events
-synthadoc audit events --json -w my-wiki      # raw JSON for scripting
-```
-
-### Scheduling recurring jobs
-
-```bash
-# Register a nightly ingest
-synthadoc schedule add --op "ingest --batch raw_sources/" --cron "0 2 * * *" -w my-wiki
-
-# Weekly lint
-synthadoc schedule add --op "lint" --cron "0 3 * * 0" -w my-wiki
-
-# List scheduled jobs
-synthadoc schedule list -w my-wiki
-
-# Remove a scheduled job
-synthadoc schedule remove <id> -w my-wiki
-```
-
-### Removing a wiki
-
-Stop the server for that wiki before uninstalling — the serve process must not be running
-when the directory is deleted.
-
-```bash
-# Stop the background server (PID is in <wiki-root>/.synthadoc/server.pid)
-kill $(cat ~/wikis/my-wiki/.synthadoc/server.pid)          # Linux / macOS
-taskkill /PID <pid> /F                                      # Windows
-
-# Then uninstall — two-step confirmation required, no --yes escape
-synthadoc uninstall my-wiki
-```
-
-For Obsidian plugin commands see [Appendix A — Obsidian Plugin Command Reference](docs/user-quick-start-guide.md#appendix-a--obsidian-plugin-commands) in the Quick-Start Guide.
-
----
-
-## Administrative Reference
-
-### Health and status
-
-```bash
-# Wiki statistics: pages, queue depth, cache hit rate
-synthadoc status -w my-wiki
-
-# Liveness probe (useful in scripts and monitoring)
-# Port is per-wiki — check [server] port in <wiki-root>/.synthadoc/config.toml
-# Default is 7070; each additional wiki uses its own port (7071, 7072, …)
-curl http://127.0.0.1:7070/health
-```
-
-Expected `status` output:
-
-```
-Wiki:         /home/user/wikis/my-wiki
-Pages:        34
-Jobs pending: 0
-Jobs total:   12
-```
-
-### Logs
-
-Synthadoc writes three log artefacts per wiki:
-
-
-| File            | Location                          | Format                  | Use                                                                 |
-| --------------- | --------------------------------- | ----------------------- | ------------------------------------------------------------------- |
-| `log.md`        | `<wiki-root>/log.md`              | Human-readable Markdown | Read inside Obsidian; shows every ingest, contradiction, lint event |
-| `synthadoc.log` | `<wiki-root>/.synthadoc/logs/`    | JSON lines (rotating)   | Structured debug/ops log; grep or pipe to jq                        |
-| `audit.db`      | `<wiki-root>/.synthadoc/audit.db` | SQLite (append-only)    | Source hashes, cost records, job history                            |
-
-**Tailing the JSON log:**
-
-```bash
-# Tail and pretty-print with jq
-tail -f .synthadoc/logs/synthadoc.log | jq .
-
-# Filter to errors only
-tail -f .synthadoc/logs/synthadoc.log | jq 'select(.level == "ERROR")'
-
-# Filter to a specific job
-# job_id is present only on records logged in job context (ingest/lint workers)
-tail -f .synthadoc/logs/synthadoc.log | jq 'select(.job_id == "abc123")'
-```
-
-**Log rotation:** When `synthadoc.log` reaches `max_file_mb`, it is renamed to `synthadoc.log.1`; the previous `.1` becomes `.2`; files beyond `backup_count` are deleted. Total disk ≈ `max_file_mb × (backup_count + 1)`.
-
-**Changing log level at runtime:** Edit `[logs] level` in `.synthadoc/config.toml` and restart `synthadoc serve`. Or pass `--verbose` to get `DEBUG` for one session without editing config.
-
-### Audit trail
-
-```bash
-synthadoc audit history -w my-wiki          # table: timestamp, source file, wiki page, tokens, cost
-synthadoc audit history -n 100 -w my-wiki   # last 100 records (default 50)
-synthadoc audit history --json -w my-wiki   # raw JSON for scripting
-
-synthadoc audit cost -w my-wiki             # total tokens + daily breakdown, last 30 days
-synthadoc audit cost --days 7 -w my-wiki    # weekly view
-synthadoc audit cost --json -w my-wiki      # {total_tokens, total_cost_usd, daily: [...]}
-
-synthadoc audit events -w my-wiki           # table: timestamp, job_id, event type, metadata
-synthadoc audit events --json -w my-wiki    # raw JSON
-```
-
-> **Note:** In v0.1, `cost_usd` for ingest was always `$0.0000`. In v0.2, query costs are tracked using an approximate rate. Per-model pricing tables are planned for a future release — token counts are always accurate.
-
-### Cache management
-
-```bash
-# Remove all cached LLM responses
-# Output: "Cache cleared: N entries removed."
-synthadoc cache clear -w my-wiki
-```
-
-Cache invalidation happens automatically when:
-
-- A source file's SHA-256 hash changes (content changed)
-- `CACHE_VERSION` is bumped in `core/cache.py` (after prompt template edits)
-- `--force` is passed to ingest
-
-### OpenTelemetry integration
-
-By default, traces and metrics are written to `<wiki-root>/.synthadoc/logs/traces.jsonl`. To send to any OTLP backend (Jaeger, Grafana Tempo, Honeycomb, Datadog):
+Defaults are sensible enough that the demo works out of the box. Real
+deployments tune `<wiki-root>/.synthadoc/config.toml`:
 
 ```toml
-# ~/.synthadoc/config.toml
-[observability]
-exporter      = "otlp"
-otlp_endpoint = "http://localhost:4317"
+[wiki]
+domain = "My Domain"
+
+[server]
+port = 7070
+
+[agents]
+default = { provider = "gemini",    model = "gemini-2.5-flash-lite" }
+ingest  = { provider = "anthropic", model = "claude-sonnet-4-6" }
+
+# Optional KB roles — both fall back to `ingest` then `default` if absent.
+# Point `facts` at a stronger model if extraction yield is low.
+summary = { provider = "gemini",    model = "gemini-2.5-flash" }
+facts   = { provider = "anthropic", model = "claude-opus-4-7" }
+
+# 0 = unbounded. Cap to abort runaway extraction per source.
+[ingest]
+max_pages_per_ingest         = 15
+max_tokens_per_fact_extract  = 30000
+
+[cost]
+soft_warn_usd = 0.50
+hard_gate_usd = 2.00
+
+[search]
+vector              = false   # set true to opt in to BAAI/bge-small-en-v1.5 re-ranking
+vector_top_candidates = 20
+
+[logs]
+level        = "INFO"
+max_file_mb  = 5
+backup_count = 5
 ```
 
-### Debugging
+Full configuration reference (layer precedence, all keys, defaults):
+see [`docs/user-quick-start-guide.md`](docs/user-quick-start-guide.md)
+Appendix E, plus [`docs/temporal-kb.md`](docs/temporal-kb.md) for the
+KB-specific knobs.
+
+---
+
+## Architecture
+
+```
+synthadoc/
+├── agents/                 # ingest / query / lint / consolidate / scaffold (page tier)
+│                          # source_summary / fact_extract / decision_extract / unknown_extract
+│                          # entity_render / history_render (KB tier)
+├── kb/                     # KB-tier library (no Synthadoc-agent dependencies)
+│   ├── ids.py             # stable ID generators + validators (closed vocab)
+│   ├── frontmatter.py     # discriminated YAML read/write
+│   ├── db.py              # KBDB — sources, entities, facts, decisions, unknowns, links
+│   ├── layout.py          # folder constants + raw-source immutability guard
+│   ├── rules.py           # kb_config.yaml resolution rule loader
+│   ├── resolver.py        # pure facts → current-state per entity
+│   ├── entity_linker.py   # deterministic name → entity_id
+│   ├── links.py           # wikilink extractor + per-file emission + relink_all
+│   ├── import_source.py   # idempotent (SHA) source → kb/sources/ + DB row
+│   ├── pipeline.py        # end-to-end orchestrator (one source)
+│   └── maintenance/       # contradictions, stale, evidence, duplicates,
+│                          # broken_links, people_safety, report aggregator
+├── core/                   # orchestrator, queue, cache, scheduler, cost_guard, hooks
+├── cli/                    # typer sub-apps (install, use, serve, ingest, query,
+│                          # lint, jobs, audit, schedule, scaffold, consolidate,
+│                          # cache, status, kb)
+├── providers/              # anthropic / openai / gemini / groq / minimax /
+│                          # deepseek / ollama / coding-tool (claude-code, opencode)
+├── skills/                 # ingest skills: md, txt, pdf, docx, pptx, xlsx, url,
+│                          # image, youtube, web_search
+├── storage/                # WikiStorage (page tier), HybridSearch (BM25 + optional vector)
+├── observability/          # OTel setup; idempotent for tests
+└── integration/            # FastAPI HTTP server + MCP server + worker loop
+```
+
+The page-tier and KB-tier layers are decoupled — `kb/` has no
+dependencies on `agents/` or `storage/`. You can drive the KB
+programmatically from a Python script without touching the page-tier
+storage at all (useful for evaluation harnesses).
+
+Full design + plugin development guide: [`docs/design.md`](docs/design.md).
+
+---
+
+## Testing
+
+The fork ships **1,072 passing tests** (one pre-existing path-traversal
+test fails on `main` too — tracked separately). Two coverage tiers:
+
+| Suite | What it proves |
+|---|---|
+| `tests/{cli,core,storage,...}` | Page tier — IngestAgent, orchestrator, queue, search, providers (804 tests upstream + smoothed) |
+| `tests/kb/` | Temporal tier — IDs, frontmatter, DB, layout, resolver, entity linker, every agent, pipeline, maintenance, end-to-end corpora, spec §9 acceptance threshold runner (~330 tests) |
+
+Run the full suite:
 
 ```bash
-# Start server with DEBUG console logging
-synthadoc serve -w my-wiki --verbose
-
-# Check for configuration problems
-synthadoc status -w my-wiki     # prints pre-flight warnings
-
-# View recent job failures
-synthadoc jobs list --status failed -w my-wiki
-synthadoc jobs status <job-id> -w my-wiki    # shows error message + traceback
-
-# Force a re-ingest to rule out cache issues
-synthadoc ingest --force problem.pdf -w my-wiki
+pytest --ignore=tests/performance -q
 ```
 
----
+Run only the KB tier:
 
-## Understanding Logs and the Audit Trail
+```bash
+pytest tests/kb -q
+```
 
-Synthadoc writes three log artefacts per wiki: `log.md` (human-readable Markdown, open in Obsidian), `synthadoc.log` (JSON lines, rotate-by-size, grep with `jq`), and `audit.db` (append-only SQLite — source hashes, cost records, job history).
-
-For the full field reference, log levels, rotation config, OTel integration, and audit query examples see [docs/design.md — Logs and Audit Trail](docs/design.md#logs-and-audit-trail).
-
----
-
-## Customization
-
-### Custom skills (new file formats)
-
-Subclass `BaseSkill` (Apache-2.0 — no AGPL obligation on your skill code), drop the file in `<wiki-root>/skills/` or `~/.synthadoc/skills/`, and Synthadoc hot-loads it on the next ingest. Skills can match by file extension or intent prefix (supports any Unicode text, including Chinese/Japanese/Arabic prefixes).
-
-### Custom LLM providers
-
-Subclass `LLMProvider` from `synthadoc/providers/base.py` (Apache-2.0) and place it in `~/.synthadoc/providers/` or the wiki `providers/` directory.
-
-### Hooks
-
-Shell commands (any language) that fire on `on_ingest_complete` and `on_lint_complete`. Receive a JSON context on stdin. Set `blocking = true` to gate the operation on the hook's exit code.
-
-### Cache
-
-Three cache layers (embedding, LLM response, provider prompt cache). Cache invalidates automatically on source file change (SHA-256). Force a fresh call with `--force` or wipe all responses with `synthadoc cache clear -w my-wiki`.
-
-### Per-wiki AGENTS.md
-
-Edit `<wiki-root>/AGENTS.md` to give the LLM domain-specific instructions — terminology, page naming conventions, what to cross-reference. Highest-priority instruction source for every agent run against this wiki.
-
-For full examples, API signatures, and intent-dispatch config see [docs/design.md — Customization](docs/design.md#customization).
+The spec §9 acceptance-threshold runner (`tests/kb/test_spec9_thresholds.py`)
+is a single comprehensive test against a golden corpus that asserts
+every numeric threshold the spec sets for prototype acceptance (≥90%
+fact extraction, ≥95% link validity, 100% raw-source immutability, 0
+deletion of superseded facts, etc.).
 
 ---
 
 ## Links
 
-- Design document: [docs/design.md](docs/design.md)
-- Quick-Start Guide: [docs/user-quick-start-guide.md](docs/user-quick-start-guide.md)
-- Contributing: [CONTRIBUTING.md](CONTRIBUTING.md)
-- Issues: [GitHub Issues](../../issues)
+- **Temporal KB**
+  - User guide: [`docs/temporal-kb.md`](docs/temporal-kb.md)
+  - Soak-test playbook: [`docs/temporal-kb-soak-test.md`](docs/temporal-kb-soak-test.md)
+  - Spec: [`temporal_markdown_knowledge_base_spec.md`](temporal_markdown_knowledge_base_spec.md)
+  - Implementation plan + session journal: [`temporal_kb_implementation_plan.md`](temporal_kb_implementation_plan.md)
+- **Page tier**
+  - Design: [`docs/design.md`](docs/design.md)
+  - Quick-start guide: [`docs/user-quick-start-guide.md`](docs/user-quick-start-guide.md)
+  - Pre-fork README: [`README.old.md`](README.old.md)
+- **Project**
+  - Contributing: [`CONTRIBUTING.md`](CONTRIBUTING.md)
+  - License: AGPL-3.0

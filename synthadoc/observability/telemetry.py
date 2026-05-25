@@ -35,11 +35,26 @@ class _JsonlExporter(SpanExporter):
 
 
 def setup_telemetry(trace_path: Optional[Path] = None) -> None:
+    """Initialise the OTel provider + optional jsonl exporter.
+
+    The OpenTelemetry SDK only honours the first `set_tracer_provider` call
+    per process. Subsequent calls would silently drop new exporters — bad
+    for tests and bad for callers that want to re-route traces at runtime.
+    This function detects the existing provider and *adds* the new
+    exporter to it instead, so each caller's spans land in their requested
+    file (in addition to any previously-configured exporters).
+    """
     global _tracer
-    provider = TracerProvider()
+    existing = trace.get_tracer_provider()
+    if isinstance(existing, TracerProvider):
+        provider = existing
+    else:
+        provider = TracerProvider()
+        trace.set_tracer_provider(provider)
     if trace_path:
-        provider.add_span_processor(SimpleSpanProcessor(_JsonlExporter(Path(trace_path))))
-    trace.set_tracer_provider(provider)
+        provider.add_span_processor(
+            SimpleSpanProcessor(_JsonlExporter(Path(trace_path)))
+        )
     _tracer = trace.get_tracer("synthadoc")
 
 

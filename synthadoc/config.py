@@ -40,19 +40,29 @@ class AgentsConfig:
     query: Optional[AgentConfig] = None
     lint: Optional[AgentConfig] = None
     skill: Optional[AgentConfig] = None
+    # Temporal-KB roles (Layer 2). Default = inherit from `ingest` / `default`.
+    facts: Optional[AgentConfig] = None
+    summary: Optional[AgentConfig] = None
     llm_timeout_seconds: int = 0  # 0 = no limit (provider default)
 
     def resolve(self, agent_name: str) -> AgentConfig:
         """Return the effective AgentConfig for *agent_name*.
 
-        If the agent has an override, it is already merged with the default's
-        values at parse time, so we simply return it.  Falls back to default
-        when no override exists.
+        Overrides are already merged with the default's values at parse time,
+        so for the classic roles we simply return them. The temporal-KB roles
+        (``facts``, ``summary``) fall back to ``ingest`` before ``default`` so
+        a user who only points ``ingest`` at a stronger model gets that
+        benefit for free.
         """
         override = getattr(self, agent_name, None)
         if override is None:
-            return self.default
-        # override was parsed with defaults filled in, so re-merge explicitly
+            if agent_name in ("facts", "summary") and self.ingest is not None:
+                src = self.ingest
+            else:
+                src = self.default
+            return AgentConfig(
+                provider=src.provider, model=src.model, base_url=src.base_url
+            )
         return AgentConfig(
             provider=override.provider,
             model=override.model,
@@ -78,6 +88,10 @@ class IngestConfig:
     chunk_size: int = 1500
     chunk_overlap: int = 150
     fetch_timeout_seconds: int = 30
+    # Per-source token budget for fact extraction (0 = unbounded). A runaway
+    # LLM response that exceeds this raises FactExtractBudgetExceeded inside
+    # the kb pipeline; the page-tier ingest is unaffected.
+    max_tokens_per_fact_extract: int = 0
 
 
 @dataclass
@@ -247,6 +261,22 @@ def _raw_to_config(raw: dict, source_has_agents: bool) -> Config:
             _validate_provider(parsed)
             setattr(agents, name, parsed)
 
+    # Temporal-KB roles inherit from `ingest` first, then `default`, so a user
+    # who only points `ingest` at a stronger model gets that benefit on
+    # fact extraction and source summaries for free.
+    _ingest_or_default = agents.ingest or default_agent
+    for name in ("facts", "summary"):
+        if name in a:
+            base_vals = {
+                "provider": _ingest_or_default.provider,
+                "model": _ingest_or_default.model,
+                "base_url": _ingest_or_default.base_url,
+            }
+            base_vals.update(a[name])
+            parsed = _parse_agent(base_vals)
+            _validate_provider(parsed)
+            setattr(agents, name, parsed)
+
     # --- cost ---
     c = raw.get("cost", {})
     cost = CostConfig(
@@ -262,6 +292,7 @@ def _raw_to_config(raw: dict, source_has_agents: bool) -> Config:
         chunk_size=ig.get("chunk_size", 1500),
         chunk_overlap=ig.get("chunk_overlap", 150),
         fetch_timeout_seconds=ig.get("fetch_timeout_seconds", 30),
+        max_tokens_per_fact_extract=int(ig.get("max_tokens_per_fact_extract", 0)),
     )
 
     # --- query ---

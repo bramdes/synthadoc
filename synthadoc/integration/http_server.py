@@ -201,6 +201,9 @@ async def _worker_loop(orch) -> None:
                         elif job.operation == "scaffold":
                             domain = job.payload.get("domain", "")
                             await orch._run_scaffold(job.id, domain=domain)
+                        elif job.operation == "kb_pipeline":
+                            source_id = job.payload.get("source_id", "")
+                            await orch._run_kb_pipeline(job.id, source_id=source_id)
                 except TimeoutError:
                     # Cancellation propagated as TimeoutError out of the inner
                     # await — the orchestrator's try/except never ran, so the

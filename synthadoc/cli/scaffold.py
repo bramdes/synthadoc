@@ -86,7 +86,11 @@ def _run_scaffold(dest: Path, domain: str, protected_slugs: Optional[list[str]] 
         provider = make_provider("ingest", cfg)
         from synthadoc.agents.scaffold_agent import ScaffoldAgent
         agent = ScaffoldAgent(provider=provider)
-        return asyncio.run(agent.scaffold(domain=domain, protected_slugs=protected_slugs))
+        kb_initialized = (dest / ".synthadoc" / "kb.db").exists()
+        return asyncio.run(agent.scaffold(
+            domain=domain, protected_slugs=protected_slugs,
+            kb_initialized=kb_initialized,
+        ))
     except Exception as exc:
         import logging
         logging.getLogger(__name__).warning("Scaffold LLM call failed: %s", exc)

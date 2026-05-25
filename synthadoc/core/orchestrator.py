@@ -187,6 +187,9 @@ class Orchestrator:
                 "tokens_used": result.tokens_used,
                 "cost_usd": result.cost_usd,
             })
+            # Best-effort parallel fact-tier pipeline (plan §9 Layer 2).
+            # Failures here never affect the page-tier ingest result.
+            await self._enqueue_kb_pipeline(source)
         except (NotImplementedError, FileNotFoundError) as e:
             # Permanent failures — source is invalid, retry can never help
             await self._queue.fail_permanent(job_id, str(e))
@@ -361,6 +364,93 @@ class Orchestrator:
             })
         except Exception as e:
             await self._queue.fail(job_id, str(e))
+            raise
+
+    # -----------------------------------------------------------------------
+    # Temporal KB (Layer 2) — best-effort fact-tier pipeline
+    # -----------------------------------------------------------------------
+
+    async def _enqueue_kb_pipeline(self, source: str) -> Optional[str]:
+        """Import a local-file source into kb.db and enqueue a kb_pipeline job.
+
+        Never raises — best-effort, non-fatal per plan §9 Layer 2. Returns the
+        new job id, or ``None`` if the import was skipped (URL/web-search
+        source, missing file, kb tier not initialised, or anything else).
+        """
+        from synthadoc.kb.layout import KBLayout
+        from synthadoc.kb.db import KBDB
+        from synthadoc.kb.import_source import guess_source_type, import_source
+
+        try:
+            src_path = Path(source)
+            if not src_path.is_file():
+                return None  # URL, web-search, or otherwise non-local — skip
+            layout = KBLayout(self._root)
+            if not layout.db_path.exists():
+                logger.debug("kb tier not initialised for %s — skipping fact-tier pipeline",
+                             self._root)
+                return None
+            db = KBDB(layout.db_path)
+            await db.init()
+            src_id, _ = await import_source(
+                src_path=src_path,
+                source_type=guess_source_type(src_path),
+                db=db, layout=layout,
+            )
+            return await self._queue.enqueue(
+                "kb_pipeline", {"source_id": src_id},
+            )
+        except Exception as exc:
+            logger.warning(
+                "kb pipeline enqueue failed for %s: %s", source, exc,
+            )
+            return None
+
+    async def _run_kb_pipeline(self, job_id: str, source_id: str) -> None:
+        """Worker entry point for the ``kb_pipeline`` operation.
+
+        Loads the kb-side dependencies, runs the pipeline, and marks the job
+        complete. The pipeline itself never raises — failures land in
+        ``result.errors`` and are surfaced via the job result payload.
+        """
+        from synthadoc.kb.db import KBDB
+        from synthadoc.kb.layout import KBLayout
+        from synthadoc.kb.pipeline import run_pipeline
+        from synthadoc.kb.rules import load as load_rules
+
+        try:
+            layout = KBLayout(self._root)
+            if not layout.db_path.exists():
+                await self._queue.fail_permanent(
+                    job_id, "kb tier not initialised (run `synthadoc kb init`)"
+                )
+                return
+            db = KBDB(layout.db_path)
+            await db.init()
+            rules = load_rules(layout.config_path)
+            summary_provider = make_provider("summary", self._cfg)
+            facts_provider = make_provider("facts", self._cfg)
+            result = await run_pipeline(
+                source_id=source_id,
+                db=db, layout=layout, rules=rules,
+                summary_provider=summary_provider,
+                facts_provider=facts_provider,
+                max_tokens_per_fact_extract=self._cfg.ingest.max_tokens_per_fact_extract,
+            )
+            await self._queue.complete(job_id, result={
+                "source_id": source_id,
+                "summary_written": result.summary_written,
+                "facts_persisted": result.facts_persisted,
+                "facts_rejected": result.facts_rejected,
+                "entities_rendered": result.entities_rendered,
+                "entities_queued_for_review": result.entities_queued_for_review,
+                "errors": result.errors,
+                "ok": result.ok,
+            })
+        except Exception as exc:
+            # Defensive — run_pipeline shouldn't raise, but if anything in the
+            # surrounding setup does, we fail the job cleanly.
+            await self._queue.fail(job_id, f"{type(exc).__name__}: {exc}")
             raise
 
     async def _run_lint(self, job_id: str, scope: str = "all", auto_resolve: bool = False) -> None:
