@@ -1,84 +1,99 @@
-# Temporal KB Soak Test — `syntha_meetings`
+# Temporal KB Soak Test — `syntha_meetings_v2`
 
-A manual playbook for adopting the temporal KB tier on a real wiki and
-verifying the prompts work on real ambiguity. Designed to be safe
-(every step is non-destructive to your existing `wiki/` pages) and
-inspectable (stop at any checkpoint and look at what landed).
+A manual playbook for soak-testing the temporal KB tier on a **fresh,
+side-by-side wiki**. Designed to be safe (your existing wikis are
+never touched) and inspectable (stop at any checkpoint and look at
+what landed).
 
-**Target wiki:** `syntha_meetings` at `C:\Proj\syntha_meetings`
+**Target wiki:** `syntha_meetings_v2` at `C:\Proj\syntha_meetings_v2` (new)
+**Existing wiki (untouched):** `syntha_meetings` at `C:\Proj\syntha_meetings`
 **Engine:** `C:\Proj\synthadoc` (running on Gemini 3.1 Pro Preview per your `[agents]` config)
 
-> **What this is going to do.** Create a `kb/` folder + `.synthadoc/kb.db`
-> inside the wiki. Populate `kb.db` with source rows for files you've
-> already ingested. Run the LLM-driven fact / decision / unknown
-> extractors on at least one source. Spend ~5-50K tokens per source
-> on Gemini. Your existing `wiki/*.md` pages are **never** modified by
-> any step here.
+> **Why a new wiki?** The temporal KB tier auto-runs on every
+> `synthadoc ingest`. Adopting it on the existing `syntha_meetings`
+> wiki would mean every future meeting also gets a kb-pipeline pass —
+> useful eventually, but you want to feel out prompt quality first.
+> A second wiki lets you ingest the same source files into both and
+> compare side-by-side without committing.
+
+> **What this is going to spend.** ~5-50K Gemini tokens per ingested
+> meeting (summary + fact extract + decision extract + unknown extract).
+> Cap it with `[ingest] max_tokens_per_fact_extract` in the v2 wiki's
+> config if you want a hard ceiling per source.
 
 ---
 
-## 0. Pre-flight
+## 0. Install the new wiki
+
+Both terminals start from `C:\Proj\synthadoc`. Activate the venv first:
 
 ```powershell
-# In the engine repo
 cd C:\Proj\synthadoc
-
-# Sanity-check which wiki is active
-.\.venv\Scripts\synthadoc.exe use
-# Expect: "Active wiki: 'syntha_meetings'" (or similar)
+.\.venv\Scripts\Activate.ps1
 ```
 
-**Stop the running server.** The kb tier is opt-in; running `kb init`
-while the server is up is harmless (the server only watches `jobs.db`),
-but later steps benefit from the server being up to drain the kb_pipeline
-queue jobs. So:
+Install the wiki (parent directory `C:\Proj\`, name `syntha_meetings_v2`,
+matching the same domain wording you used on the original):
 
 ```powershell
-# If the server is running in another terminal (you mentioned PID 47412):
-taskkill /PID 47412 /F
-# OR: just hit Ctrl-C in the terminal where you ran `synthadoc serve`
+synthadoc install syntha_meetings_v2 --target C:\Proj --domain "Meetings, projects, decisions, people, and open issues"
 ```
 
-**Backup `.synthadoc/`** (the SQLite databases — small and easy to
-restore if you want a clean slate):
+This creates:
+
+- `C:\Proj\syntha_meetings_v2\wiki\` — empty wiki + scaffolded `index.md`,
+  `purpose.md`, `dashboard.md`.
+- `C:\Proj\syntha_meetings_v2\AGENTS.md` — domain-tailored guidelines.
+- `C:\Proj\syntha_meetings_v2\.synthadoc\config.toml` — auto-allocates
+  a free port (probably 7071 since 7070 is taken by the existing wiki).
+- `C:\Proj\syntha_meetings_v2\raw_sources\` — empty.
+
+Mirror the LLM config from the original wiki so the comparison is fair:
 
 ```powershell
-Copy-Item -Recurse -Force `
-   "C:\Proj\syntha_meetings\.synthadoc" `
-   "C:\Proj\syntha_meetings\.synthadoc.backup-pre-kb"
+# Open the new config
+notepad C:\Proj\syntha_meetings_v2\.synthadoc\config.toml
 ```
 
-If anything goes sideways you can `rm -r .synthadoc` and rename the
-backup back into place. Your `wiki/` is unaffected at any step.
+Edit the `[agents]` block to match your existing setup, e.g.:
+
+```toml
+[agents]
+default = { provider = "gemini", model = "gemini-3.1-pro-preview" }
+
+# Optional — cap runaway fact-extraction cost per source.
+# Leave commented out to start; uncomment once you see real numbers.
+# [ingest]
+# max_tokens_per_fact_extract = 30000
+```
+
+Save & close.
 
 ---
 
 ## 1. Initialise the kb tier
 
 ```powershell
-.\.venv\Scripts\synthadoc.exe kb init -w syntha_meetings
+synthadoc kb init -w syntha_meetings_v2
 ```
 
 You should see:
 
 ```
 KB tier initialised.
-  kb/          C:\Proj\syntha_meetings\kb
-  kb.db        C:\Proj\syntha_meetings\.synthadoc\kb.db
-  config       C:\Proj\syntha_meetings\kb_config.yaml
+  kb/          C:\Proj\syntha_meetings_v2\kb
+  kb.db        C:\Proj\syntha_meetings_v2\.synthadoc\kb.db
+  config       C:\Proj\syntha_meetings_v2\kb_config.yaml
 ```
 
-**Inspect what landed:**
+**Skim the resolution rules** — they're sensible defaults for a
+meetings-heavy wiki, but worth a glance:
 
 ```powershell
-# Folder tree (should be empty except for the maintenance stub files)
-Get-ChildItem -Recurse "C:\Proj\syntha_meetings\kb" | Select-Object FullName
-
-# Resolution rules — read and adjust if any fact_type needs a different strategy
-notepad "C:\Proj\syntha_meetings\kb_config.yaml"
+notepad C:\Proj\syntha_meetings_v2\kb_config.yaml
 ```
 
-For a meetings-heavy wiki the default rules are sensible:
+The defaults relevant for meetings:
 - `project.status` / `project.owner` → `latest_valid_at_wins`
 - `project.scope` → `requires_review` (won't auto-overwrite)
 - `decision.made` → `append_only`
@@ -87,139 +102,92 @@ Save & close.
 
 ---
 
-## 2. Backfill source rows from your existing audit history
+## 2. Start the v2 server
 
-This populates `kb.db.sources` from the ingest records already in
-`.synthadoc/audit.db`. No LLM calls; no fact extraction. Just an index
-of what you've ingested.
+In a fresh terminal:
 
 ```powershell
-# Dry-run first — shows what would be inserted, writes nothing
-.\.venv\Scripts\synthadoc.exe kb backfill -w syntha_meetings --dry-run
+cd C:\Proj\synthadoc
+.\.venv\Scripts\Activate.ps1
+synthadoc serve -w syntha_meetings_v2
 ```
 
-Expect output like:
+Banner should show port `7071` (or whatever was auto-allocated). The
+original `syntha_meetings` server (port 7070) can keep running in its
+own terminal — they don't interfere.
 
-```
-[wiki: syntha_meetings]
-would seed: source.document.2026-05-15.standup-2026-05-15  (file=present)
-would seed: source.document.2026-05-16.weekly-review       (file=present)
-...
-Backfill complete: 42 would seed, 0 already present, 0 skipped (no source_hash).
-```
-
-If the numbers look right, run for real:
-
-```powershell
-.\.venv\Scripts\synthadoc.exe kb backfill -w syntha_meetings
-```
-
-**Verify:**
-
-```powershell
-# Count source rows
-sqlite3 "C:\Proj\syntha_meetings\.synthadoc\kb.db" "SELECT COUNT(*) FROM sources"
-
-# Eyeball a few
-sqlite3 "C:\Proj\syntha_meetings\.synthadoc\kb.db" `
-   "SELECT id, source_type, title, raw_path FROM sources LIMIT 5"
-```
-
-At this point the kb tier exists as a passive index. Page-tier writes
-continue to ignore it; nothing about your `wiki/` has changed.
+Leave this terminal open.
 
 ---
 
 ## 3. Test on ONE source first
 
-The safest soak test is to run the full kb pipeline against a single
-source end-to-end and inspect every file it produces. Two ways:
+Pick a recent meeting transcript to start with — *one* file, not the
+whole month. The goal is to read every produced artifact by hand
+before scaling up.
 
-### Option A (recommended): ingest a fresh meeting
-
-When your next standup transcript lands under
-`C:\Proj\obsidian_notes_2026\Meetings\2026\05\`, ingest it normally.
-The orchestrator's `_enqueue_kb_pipeline` hook will fire automatically
-after the page-tier ingest succeeds:
+In your first terminal (where you ran `kb init`):
 
 ```powershell
-# Start the server in one terminal:
-.\.venv\Scripts\synthadoc.exe serve -w syntha_meetings
-
-# In another terminal, ingest one file:
-.\.venv\Scripts\synthadoc.exe ingest `
-   "C:\Proj\obsidian_notes_2026\Meetings\2026\05\2026-05-24-standup.md" `
-   -w syntha_meetings
-
-# Watch the jobs queue
-.\.venv\Scripts\synthadoc.exe jobs list -w syntha_meetings
+synthadoc ingest `
+   "C:\Proj\obsidian_notes_2026\Meetings\2026\05\<file>.md" `
+   -w syntha_meetings_v2
 ```
 
-You'll see TWO jobs land:
-- One `ingest` job — runs the page-tier (your existing wiki update).
-- One `kb_pipeline` job — runs the fact-tier (summary + facts + decisions + unknowns + render).
+You'll get a job id. Two jobs will land in the queue:
 
-Wait for both to reach `completed`. The kb_pipeline job typically takes
-10-60 seconds depending on transcript length.
+- **`ingest`** — runs the page-tier work (writes `wiki/<slug>.md` etc.).
+- **`kb_pipeline`** — runs the fact-tier work (summary + facts +
+  decisions + unknowns + entity render).
 
-**If you'd rather not wait for a new meeting,** you can re-feed one
-recent meeting from the existing pile by pointing your feed script at a
-narrower window:
+Watch them complete:
 
 ```powershell
-powershell -NoProfile -ExecutionPolicy Bypass `
-   -File "C:\Proj\syntha_meetings_test\feed_meetings.ps1" `
-   -MeetingsRoot "C:\Proj\obsidian_notes_2026\Meetings\2026\05" `
-   -Days 1
+synthadoc jobs list -w syntha_meetings_v2
+# Re-run until both show "completed". The kb_pipeline job typically
+# takes 10-60 seconds depending on transcript length.
 ```
 
-The deduplication check in IngestAgent will skip files whose SHA-256 is
-already in `audit.db`, so this only ingests anything *new*. If nothing
-is new and you really want to soak-test, you can pass `--force` to
-re-ingest a specific file — but that also re-runs the page-tier, so
-your `wiki/<slug>.md` will get an additional appended section. Only
-use `--force` when you don't mind the wiki page growing.
+If either fails, drill in:
 
-### Option B: pick one historical source and dry-run the pipeline by hand
-
-If you'd rather sample an existing source without re-feeding, the kb
-pipeline doesn't currently have a standalone `synthadoc kb pipeline <id>`
-CLI (that's tracked as a small Layer 4 follow-up). Until then, Option A
-is the cleanest path.
+```powershell
+synthadoc jobs status <job-id> -w syntha_meetings_v2
+```
 
 ---
 
 ## 4. Inspect the produced markdown by hand
 
-After the kb_pipeline job completes, four families of files should
-exist for the test source. Open each one in your editor and verify
-against the checklist below.
+After both jobs complete, four families of files should exist for the
+test source. Open each one in your editor.
 
 ### Where to look
 
 ```powershell
 # Source summary
-ls "C:\Proj\syntha_meetings\kb\source_summaries\documents\"
-# or \meetings\ if your --type guess hit meeting_transcript
+ls C:\Proj\syntha_meetings_v2\kb\source_summaries\
 
 # Facts emitted from this source (grouped by entity)
-ls "C:\Proj\syntha_meetings\kb\facts\projects\"
-ls "C:\Proj\syntha_meetings\kb\facts\people\"
+ls C:\Proj\syntha_meetings_v2\kb\facts\projects\
+ls C:\Proj\syntha_meetings_v2\kb\facts\people\
 
 # Decisions (if any explicit ones were in the source)
-ls "C:\Proj\syntha_meetings\kb\decisions\"
+ls C:\Proj\syntha_meetings_v2\kb\decisions\
 
 # Unknowns (if the source raised any)
-ls "C:\Proj\syntha_meetings\kb\unknowns\projects\"
+ls C:\Proj\syntha_meetings_v2\kb\unknowns\projects\
 
 # Synthesized entity views
-ls "C:\Proj\syntha_meetings\kb\entities\projects\"
-ls "C:\Proj\syntha_meetings\kb\entities\people\"
+ls C:\Proj\syntha_meetings_v2\kb\entities\projects\
+ls C:\Proj\syntha_meetings_v2\kb\entities\people\
+
+# For comparison: page-tier output (the existing flow)
+ls C:\Proj\syntha_meetings_v2\wiki\
 ```
 
 ### Inspection checklist
 
-Read every produced file and tick off the items:
+Tick off as you read every produced file:
 
 **Source summary** (`kb/source_summaries/.../<slug>.md`):
 - [ ] Summary reflects what the source actually said (no invented detail).
@@ -227,114 +195,143 @@ Read every produced file and tick off the items:
 - [ ] No content "blended in" from prior meetings — strictly bounded to this source.
 
 **Facts** (`kb/facts/<type>/<slug>/<fact-type>/<date>-<value>.md`):
-- [ ] **`source_quote` is verbatim** from the parsed source body. Open the source side-by-side — every character must match. (The agent's substring guard rejects paraphrases, but it's worth eyeballing.)
-- [ ] `fact_type` matches what the source actually states (e.g. `project.status` for "X is now complete", not `project.scope`).
-- [ ] `value` is normalised (lowercase, kebab-case) and matches the source's phrasing.
-- [ ] `valid_at` is the date the fact is true (often the meeting date), not today's date.
+- [ ] **`source_quote` is verbatim** from the parsed source body. Open
+  the source side-by-side — every character must match. (The agent's
+  substring guard rejects paraphrases, but eyeball it.)
+- [ ] `fact_type` matches what the source actually states (e.g.
+  `project.status` for "X is now complete", not `project.scope`).
+- [ ] `value` is normalised (lowercase, kebab-case) and matches the
+  source's phrasing.
+- [ ] `valid_at` is the date the fact is true (often the meeting date),
+  not today's date.
 - [ ] `confidence` looks reasonable for how clearly the source stated it.
 
 **Decisions** (`kb/decisions/<date>-<slug>.md`):
-- [ ] Each decision corresponds to an **explicit commitment** in the source — not an opinion, option, or hypothetical.
-- [ ] `decision_date` matches the source date (or whatever the source explicitly says).
-- [ ] `authority` reflects the source's formality (`informal` for chat, `formal` for minuted decisions).
+- [ ] Each decision corresponds to an **explicit commitment** in the
+  source — not an opinion, option, or hypothetical.
+- [ ] `decision_date` matches the source date (or whatever the source
+  explicitly says).
+- [ ] `authority` reflects the source's formality (`informal` for chat,
+  `formal` for minuted decisions).
 
 **Unknowns** (`kb/unknowns/<type>/<slug>/<slug>.md`):
-- [ ] Each unknown is a **real ambiguity** the source raises but doesn't resolve.
+- [ ] Each unknown is a **real ambiguity** the source raises but
+  doesn't resolve.
 - [ ] No "trivia unknowns" — only what genuinely matters to act on.
 
 **Entity index pages** (`kb/entities/<type>/<slug>/index.md`):
-- [ ] `## Current State` table shows the right resolved value for each `fact_type`.
+- [ ] `## Current State` table shows the right resolved value for each
+  `fact_type`.
 - [ ] `## History` section lists the chronology in date order.
 - [ ] `## Recent Changes` makes sense.
-- [ ] No personality speculation / gossip / private detail (especially on people pages — see step 5).
+- [ ] No personality speculation / gossip / private detail (especially
+  on people pages — the maintenance step in §6 surfaces these).
+
+**Page tier** (`wiki/<slug>.md`):
+- [ ] Compare to the kb output for the same source — anything in the
+  page tier that's missing from the kb tier? (Common gap: things the
+  LLM mentioned but didn't extract as a structured fact.)
 
 ### Failure modes to flag
 
-If any of these happen, file a one-line note in
-`temporal_kb_implementation_plan.md` under §14 (Open questions) so the
-next session sees them:
+If any of these happen, drop a one-liner under §14 (Open questions)
+of `temporal_kb_implementation_plan.md` so the next session sees them:
 
 | Symptom | Likely cause | Quick check |
 |---|---|---|
 | `result.errors` mentions `unparseable JSON` after retry | LLM not following the JSON shape; prompt may need tightening | `synthadoc jobs status <id>` |
-| Facts emitted with wrong `fact_type` | Closed-vocab confusion in the prompt | Look at `kb/facts/.../*.md`; compare to FACT_TYPES in `synthadoc/kb/ids.py` |
-| Two entities for the same subject ("DocIntel" and "Document Intelligence") | Entity linker is slug-exact only; doesn't fuzzy-match yet | `sqlite3 kb.db "SELECT id, name FROM entities WHERE entity_type='project'"` |
-| Empty `source_quote` on facts | Should not happen — validator rejects | If you see one, the schema column has wrong data; file an Open question |
-| Resolver picked wrong "current" value | Rules not matching your situation | Edit `kb_config.yaml`, set `minimum_confidence` or change `strategy`, re-run maintenance |
-| LLM call timed out / hit rate limit | Gemini quota; per-source budget tripping | Lower `[ingest] max_tokens_per_fact_extract` and let it abort cleanly |
+| Facts emitted with wrong `fact_type` | Closed-vocab confusion in the prompt | Open the fact `.md`; compare against FACT_TYPES in `synthadoc/kb/ids.py` |
+| Two entities for the same subject ("DocIntel" and "Document Intelligence") | Entity linker is slug-exact only; no fuzzy match yet | `sqlite3 .synthadoc\kb.db "SELECT id, name FROM entities WHERE entity_type='project'"` |
+| Empty `source_quote` on facts | Should not happen — validator rejects | If you see one, file an Open question; data corruption |
+| Resolver picked wrong "current" value | Rules not matching your situation | Edit `kb_config.yaml`, change `strategy` or `minimum_confidence`, re-run maintenance |
+| LLM call timed out / hit rate limit | Gemini quota; per-source budget tripping | Lower `[ingest] max_tokens_per_fact_extract`; agent aborts cleanly |
+| Substring-guard rejecting most facts | LLM paraphrasing instead of quoting verbatim | Switch the `facts` role to a stronger model (see §7B) |
 
 ---
 
-## 5. Run the maintenance pass
+## 5. Ingest a few more meetings
 
-After at least one source has flowed through the pipeline, run the
-deterministic maintenance:
-
-```powershell
-.\.venv\Scripts\synthadoc.exe kb maintenance run -w syntha_meetings
-```
-
-You'll see counts per category. Open `kb/maintenance/kb_health.md` —
-this is the snapshot you'd watch over time:
+Once the single-source inspection looks reasonable, batch-ingest a
+small window — say a week — and watch the queue:
 
 ```powershell
-notepad "C:\Proj\syntha_meetings\kb\maintenance\kb_health.md"
+synthadoc ingest --batch C:\Proj\obsidian_notes_2026\Meetings\2026\05    -w syntha_meetings_v2
 ```
 
-**Expected on a freshly-seeded wiki with one piloted source:**
+(`--batch` walks the directory; each file becomes its own ingest job,
+which in turn enqueues its own kb_pipeline job. The queue worker
+processes up to `[queue] max_parallel_ingest` at a time.)
+
+Watch progress:
+
+```powershell
+synthadoc jobs list -w syntha_meetings_v2
+# Filter to pending / failed:
+synthadoc jobs list --status pending -w syntha_meetings_v2
+synthadoc jobs list --status failed -w syntha_meetings_v2
+```
+
+---
+
+## 6. Run the maintenance pass
+
+After at least one source has flowed through the pipeline (and ideally
+the batch from §5 has finished), run the deterministic maintenance:
+
+```powershell
+synthadoc kb maintenance run -w syntha_meetings_v2
+```
+
+You'll see counts per category. Open `kb_health.md`:
+
+```powershell
+notepad C:\Proj\syntha_meetings_v2\kb\maintenance\kb_health.md
+```
+
+**Expected after a clean batch:**
 
 | Metric | Expected | What FAIL means here |
 |---|---|---|
-| `conflicts` | 0 | Two active facts disagree — probably from a re-ingest |
+| `conflicts` | 0 | Two active facts disagree — likely the LLM extracted contradictory facts from different meetings about the same project/date |
 | `stale_pages` | 0-5 | History older than newest fact; usually OK |
 | `orphan_facts` | 0 | Facts pointing at entities that no longer exist |
-| `facts_without_evidence` | 0 | Empty quotes — should be impossible with the agent's guard |
+| `facts_without_evidence` | 0 | Empty quotes — should be impossible |
 | `conclusions_without_facts` | 0 | (Conclusions are Layer 4) |
-| `duplicate_entity_candidates` | 0-N | Heuristic matches; some are real, some are aliasing artefacts |
+| `duplicate_entity_candidates` | 0-N | Heuristic matches; some real, some aliasing — review by hand |
 | `broken_links` | 0 | Wikilinks to slugs not on disk |
 | `people_pages_with_policy_flags` | 0 | Spec §3.7 violations — review each flagged line |
 
-**Open the per-category reports under `kb/maintenance/`** and skim them.
-The reports are overwrite-style; every `kb maintenance run` rewrites
-the snapshot.
+**Open the per-category reports under `kb/maintenance/`** and skim
+them. The reports are overwrite-style; every `kb maintenance run`
+rewrites the snapshot.
 
 ---
 
-## 6. Decide what to do next
+## 7. Decide what to do next
 
-After inspecting the test source and the maintenance report you'll
-have a feel for prompt quality. Three paths from here:
+After inspecting the test source(s) and the maintenance report you'll
+have a feel for prompt quality. Three paths:
 
-**A. Prompts work well → adopt the tier widely.**
+### A. Prompts work well → promote the v2 tier
 
-Re-feed the meetings backlog and let the kb pipeline run on everything:
+Either:
 
-```powershell
-# Run your existing feed script — only NEW meetings will be ingested
-# (the SHA dedup check skips already-ingested files), but each of those
-# triggers the kb pipeline now.
-powershell -NoProfile -ExecutionPolicy Bypass `
-   -File "C:\Proj\syntha_meetings_test\feed_meetings.ps1" `
-   -MeetingsRoot "C:\Proj\obsidian_notes_2026\Meetings\2026\05" `
-   -Days 30
+- **Adopt the temporal tier on the original `syntha_meetings` wiki** —
+  `synthadoc kb init -w syntha_meetings && synthadoc kb backfill -w syntha_meetings`,
+  then re-feed (or wait for the next standup to trigger the auto-pipeline).
+- **Switch your daily flow to `syntha_meetings_v2`** — point your
+  feed script at the new wiki and retire the old one.
 
-# Or if you want to backfill the kb tier across the existing audit history
-# (re-ingesting with --force so the orchestrator hook fires):
-# WARNING: this re-runs the page-tier ingest too — your wiki pages
-# will get duplicate sections.
-# Only do this if you've thought through the implications.
-```
-
-Schedule a nightly maintenance pass:
+Either way, schedule nightly maintenance:
 
 ```powershell
-.\.venv\Scripts\synthadoc.exe schedule add `
-   --op "kb maintenance run" --cron "0 3 * * *" -w syntha_meetings
+synthadoc schedule add `
+   --op "kb maintenance run" --cron "0 3 * * *" -w syntha_meetings_v2
 ```
 
-**B. Prompts need tuning → iterate on a stronger model.**
+### B. Prompts need tuning → iterate on a stronger model
 
-Edit `.synthadoc/config.toml`:
+Edit `C:\Proj\syntha_meetings_v2\.synthadoc\config.toml`:
 
 ```toml
 [agents]
@@ -350,35 +347,34 @@ facts   = { provider = "anthropic", model = "claude-opus-4-7" }
 max_tokens_per_fact_extract = 30000
 ```
 
-Re-run step 3 (Option A) on the same source after `synthadoc cache clear -w syntha_meetings`
-to bypass any cached extraction.
-
-**C. Bail out and try later.**
-
-Stop the server, delete `kb/` + `.synthadoc/kb.db`, restore the backup
-from step 0:
+Bust the cached extraction and re-ingest the test source:
 
 ```powershell
-Remove-Item -Recurse -Force "C:\Proj\syntha_meetings\kb"
-Remove-Item -Force "C:\Proj\syntha_meetings\.synthadoc\kb.db"
-Remove-Item -Force "C:\Proj\syntha_meetings\kb_config.yaml"
-# OR full rollback:
-Remove-Item -Recurse -Force "C:\Proj\syntha_meetings\.synthadoc"
-Rename-Item "C:\Proj\syntha_meetings\.synthadoc.backup-pre-kb" `
-            "C:\Proj\syntha_meetings\.synthadoc"
+synthadoc cache clear -w syntha_meetings_v2
+# Re-ingest one source with --force so the kb_pipeline runs again on it:
+synthadoc ingest --force "<file>.md" -w syntha_meetings_v2
 ```
 
-Your `wiki/` and `raw_sources/` are untouched throughout.
+Iterate on §4's inspection checklist until extraction yield is
+acceptable, then return to path A.
+
+### C. Bail out and try later
+
+```powershell
+# Stop the v2 server (Ctrl-C in its terminal, or kill the PID printed in the banner)
+synthadoc uninstall syntha_meetings_v2
+```
+
+The original `syntha_meetings` wiki is completely unaffected.
 
 ---
 
-## 7. What to file when something looks off
+## 8. What to file when something looks off
 
-When you spot a prompt regression or a UX gap, drop a one-liner under
-§14 (Open questions) of `temporal_kb_implementation_plan.md`. Examples
-of what's worth recording:
+Drop a one-liner under §14 (Open questions) of
+`temporal_kb_implementation_plan.md`. Examples worth recording:
 
-- "Gemini 3.1 keeps paraphrasing the source_quote — extraction yield is 60%; bump to Opus on facts?"
+- "Gemini 3.1 keeps paraphrasing the source_quote — extraction yield is 60%; bump `facts` role to Opus."
 - "Pravin and Asha are real people but the linker created `entity.person.pravin-and-asha` from a co-occurrence; needs split."
 - "Decision authority defaulted to `informal` even on minuted decisions; prompt clarification needed."
 - "Want to sample-pipeline an existing source without re-feeding → need `synthadoc kb pipeline <source-id>` CLI."
@@ -390,24 +386,34 @@ These guide the next session's prompt-tuning + small-feature work.
 ## Quick reference — commands cheat sheet
 
 ```powershell
-# Setup (one-time)
-synthadoc kb init -w syntha_meetings
-synthadoc kb backfill -w syntha_meetings
+# One-time setup
+synthadoc install syntha_meetings_v2 --target C:\Proj --domain "..."
+synthadoc kb init -w syntha_meetings_v2
 
-# Each new meeting (automatic via the orchestrator hook on ingest)
-synthadoc ingest <file> -w syntha_meetings
+# Daily flow (in two terminals)
+synthadoc serve -w syntha_meetings_v2                           # T1
+synthadoc ingest <file> -w syntha_meetings_v2                   # T2
+synthadoc ingest --batch <dir> -w syntha_meetings_v2            # T2
 
-# Inspect what got produced
+# Inspection
 sqlite3 .synthadoc\kb.db "SELECT * FROM sources LIMIT 5"
 sqlite3 .synthadoc\kb.db "SELECT * FROM facts ORDER BY observed_at DESC LIMIT 5"
+sqlite3 .synthadoc\kb.db "SELECT * FROM entities WHERE entity_type='project'"
 
 # Periodic maintenance
-synthadoc kb maintenance run -w syntha_meetings
-synthadoc kb relink -w syntha_meetings           # after manual edits
+synthadoc kb maintenance run -w syntha_meetings_v2
+synthadoc kb relink -w syntha_meetings_v2                       # after manual edits
 
 # Watch jobs
-synthadoc jobs list -w syntha_meetings
-synthadoc jobs status <id> -w syntha_meetings
+synthadoc jobs list -w syntha_meetings_v2
+synthadoc jobs status <id> -w syntha_meetings_v2
+
+# Iterate on a model change
+synthadoc cache clear -w syntha_meetings_v2
+synthadoc ingest --force <file> -w syntha_meetings_v2
+
+# Bail out
+synthadoc uninstall syntha_meetings_v2
 ```
 
 For the full feature reference see [`docs/temporal-kb.md`](./temporal-kb.md).
