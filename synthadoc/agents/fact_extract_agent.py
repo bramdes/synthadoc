@@ -48,6 +48,12 @@ _FENCE_PAIR_RE = re.compile(r"```(?:json)?\s*(.*?)\s*```", re.DOTALL)
 _FENCE_OPEN_RE = re.compile(r"^```(?:json)?\s*", re.IGNORECASE)
 _DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 _WS_RE = re.compile(r"\s+")
+# Markdown formatting markers we tolerate the LLM stripping from its quote.
+# LLMs reliably emit the "content" of a bolded span without its `**` wrappers
+# (or backticks for code, underscores for italic); we strip both sides so the
+# substring check still matches. Cannot accept paraphrases — only removals of
+# these specific marker characters.
+_MARKDOWN_MARKERS_RE = re.compile(r"[*_`]+")
 
 _SYSTEM = (
     "You are a careful information-extraction assistant. "
@@ -496,9 +502,18 @@ def _parse_json(text: str) -> dict:
 
 
 def _quote_in_body(quote: str, body: str) -> bool:
-    """Substring check with mild normalisation (NFKC + whitespace collapse).
+    """Substring check, tolerant of LLM-stripped markdown formatting.
 
-    Empty quote always rejected — `"" in body` is True in Python and we do
+    Normalisation applied to both sides:
+      * NFKC unicode normalisation
+      * markdown formatting markers stripped (``**``, ``*``, ``_``, `` ` ``)
+      * runs of whitespace collapsed to a single space
+
+    This accepts the LLM emitting ``"Amazon Bedrock (...)"`` when the source
+    has ``"**Amazon Bedrock** (...)"``. It cannot accept paraphrases — the
+    word sequence and characters (other than the listed markers) must match.
+
+    Empty quote always rejected — ``"" in body`` is True in Python and we do
     not want that to count as evidence.
     """
     if not body or not quote.strip():
@@ -512,7 +527,8 @@ def _quote_in_body(quote: str, body: str) -> bool:
 
 def _normalise(text: str) -> str:
     decomposed = unicodedata.normalize("NFKC", text)
-    return _WS_RE.sub(" ", decomposed).strip()
+    no_md = _MARKDOWN_MARKERS_RE.sub("", decomposed)
+    return _WS_RE.sub(" ", no_md).strip()
 
 
 def _render_fact_body(fact: ExtractedFact) -> str:

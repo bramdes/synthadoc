@@ -103,6 +103,43 @@ class TestQuoteInBody:
     def test_empty_body_rejected(self):
         assert not _quote_in_body("anything", "")
 
+    # The real-world false positives we observed in the v2 soak test —
+    # the LLM strips markdown formatting markers from the source as it
+    # quotes. The substring guard must tolerate this.
+
+    def test_markdown_bold_stripped_by_llm_still_matches(self):
+        body = ("- Bram has been working on migrating AI workloads from "
+                "dedicated GPU infrastructure to **Amazon Bedrock** "
+                "(AI-as-a-service, pay-per-usage model)")
+        # LLM emitted the same text without the bold markers
+        quote = "Amazon Bedrock (AI-as-a-service, pay-per-usage model)"
+        assert _quote_in_body(quote, body)
+
+    def test_markdown_bold_at_both_ends_stripped(self):
+        body = ("- **Speaker 1** — Likely **Bram** (asking architectural "
+                "questions, referencing our bosses)")
+        quote = "Speaker 1 — Likely Bram"
+        assert _quote_in_body(quote, body)
+
+    def test_inline_code_backticks_stripped(self):
+        body = "Set `entity_id` to the canonical name."
+        quote = "Set entity_id to the canonical name."
+        assert _quote_in_body(quote, body)
+
+    def test_italic_underscores_stripped(self):
+        body = "This is _really_ important."
+        quote = "This is really important."
+        assert _quote_in_body(quote, body)
+
+    def test_added_word_still_rejected(self):
+        """The relaxation only strips markers, never accepts paraphrases."""
+        body = "Drop 1 is now complete."
+        assert not _quote_in_body("Drop 1 is now fully complete.", body)
+
+    def test_reordered_words_still_rejected(self):
+        body = "Drop 1 is now complete."
+        assert not _quote_in_body("complete is now Drop 1", body)
+
 
 # ---------------------------------------------------------------------------
 # Happy path
