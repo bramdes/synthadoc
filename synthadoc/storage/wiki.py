@@ -2,6 +2,7 @@
 # Copyright (C) 2026 Paul Chen / axoviq.com
 from __future__ import annotations
 
+import re
 import threading
 from contextlib import contextmanager
 from dataclasses import dataclass, field
@@ -12,6 +13,33 @@ import yaml
 from filelock import FileLock
 
 _FRONTMATTER_FIELDS = ("title", "tags", "status", "confidence", "created", "sources", "orphan", "categories")
+
+# Obsidian tags may only contain letters, digits, _, -, and / (for nesting);
+# a space silently breaks the tag (renders struck-through, unclickable).
+_TAG_INVALID_RE = re.compile(r"[^\w/-]+", re.UNICODE)
+
+
+def _sanitize_tag(tag: str) -> str:
+    """Coerce a single tag into an Obsidian-safe form: collapse internal
+    whitespace to underscores and drop any other unsupported characters."""
+    t = re.sub(r"\s+", "_", str(tag).strip())
+    t = _TAG_INVALID_RE.sub("", t)
+    return t.strip("_-/")
+
+
+def sanitize_tags(tags) -> list[str]:
+    """Normalise a list of tags for Obsidian, dropping empties and dups
+    while preserving order."""
+    if not isinstance(tags, (list, tuple)):
+        return []
+    out: list[str] = []
+    seen: set[str] = set()
+    for tag in tags:
+        clean = _sanitize_tag(tag)
+        if clean and clean not in seen:
+            seen.add(clean)
+            out.append(clean)
+    return out
 
 
 @dataclass
@@ -129,7 +157,7 @@ class WikiStorage:
             page = page_or_content
             fm: dict = {
                 "title": page.title,
-                "tags": page.tags,
+                "tags": sanitize_tags(page.tags),
                 "status": page.status,
                 "confidence": page.confidence,
                 "created": page.created,
@@ -143,6 +171,8 @@ class WikiStorage:
             body = page.content
         else:
             fm = frontmatter or {}
+            if "tags" in fm:
+                fm["tags"] = sanitize_tags(fm["tags"])
             body = page_or_content
 
         yaml_str = yaml.dump(fm, default_flow_style=False, allow_unicode=True)
