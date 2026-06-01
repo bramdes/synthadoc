@@ -57,6 +57,7 @@ and built per
 | IDs | Stable IDs like `source.meeting.2026-05-22.<slug>`, `fact.project.<slug>.project.status.2026-05-22`. Generators + validators in `synthadoc/kb/ids.py`. |
 | Pipeline | After every successful `synthadoc ingest`, a `kb_pipeline` job runs: SourceSummary → FactExtract → DecisionExtract → UnknownExtract → resolve → EntityRender. Best-effort, non-fatal — page-tier ingest is never blocked. |
 | Maintenance | `synthadoc kb maintenance run` → conflicts, stale pages, orphan facts, facts-without-evidence, conclusions-without-basis, duplicate entities, broken links, people-page §3.7 safety. Reports under `kb/maintenance/`. |
+| Review | `synthadoc kb review list / reject / accept-fact / accept / reopen / merge` — human triage of conflicts, duplicates, and reviewed-page locks. Each action updates `kb.db` **and** the markdown, then re-resolves + re-renders. A rejected fact is excluded from every resolution strategy. |
 | Determinism | Substring-quote guard on every extracted fact (paraphrased quotes are rejected without retry). Closed vocabularies for `entity_type` / `fact_type` / `authority` / `confidence` / `review_status`. Pure resolver with `latest_valid_at_wins` / `append_only` / `requires_review` strategies. |
 | Cost guard | `[ingest] max_tokens_per_fact_extract = N` caps runaway extraction per source. |
 | Telemetry | Per-maintenance-job OTel spans (`kb.maintenance.<name>`) land in `.synthadoc/logs/traces.jsonl`. |
@@ -194,6 +195,12 @@ synthadoc kb import-source <file> --type meeting_transcript|document|email|deck|
 synthadoc kb backfill [--dry-run] -w <name>
 synthadoc kb relink -w <name>                 # rebuild links table after manual edits
 synthadoc kb maintenance run [--skip-histories] -w <name>
+
+# Review: triage conflicts, duplicates, and reviewed-page locks (DB + markdown, then re-render)
+synthadoc kb review list -w <name>            # what's awaiting a decision
+synthadoc kb review reject <fact-id> -w <name>
+synthadoc kb review merge <dup-id> --into <keeper-id> -w <name>
+synthadoc kb review accept <entity-id> -w <name>    # lock a curated page (reopen to unlock)
 ```
 
 ---

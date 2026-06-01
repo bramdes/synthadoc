@@ -112,6 +112,12 @@ def resolve_facts(
     # Group by (entity_id, fact_type)
     grouped: dict[tuple[str, str], list[dict]] = {}
     for f in facts:
+        if f.get("review_status") == "rejected":
+            # A human-rejected fact is evidence only. It must never participate
+            # in resolution under ANY strategy — including append_only and
+            # requires_review, which otherwise ignore review_status. This is
+            # what makes `synthadoc kb review reject` effective everywhere.
+            continue
         if not _is_active_input(f):
             # Facts already marked superseded in the DB are evidence, not
             # candidates. We still keep them in the grouped pool so a

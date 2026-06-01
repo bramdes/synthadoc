@@ -424,5 +424,185 @@ def maintenance_run_cmd(
             typer.echo(f"  - {err}", err=True)
 
 
+# ---------------------------------------------------------------------------
+# kb review — human triage of the review queue
+# ---------------------------------------------------------------------------
+
+
+review_app = typer.Typer(
+    name="review",
+    help="Triage the KB review queue: list pending items, reject facts, "
+         "merge duplicate entities, lock reviewed pages.",
+)
+kb_app.add_typer(review_app)
+
+
+def _review_ctx(wiki: Optional[str]):
+    """Resolve (layout, rules) for a review command, or exit with a hint."""
+    from synthadoc.kb import rules as kb_rules
+    root = _resolve_wiki_root(wiki)
+    layout = KBLayout(root)
+    if not layout.db_path.exists():
+        E.cli_error(
+            E.WIKI_INVALID, "kb.db not found.", "Run `synthadoc kb init` first.",
+        )
+    return layout, kb_rules.load(layout.config_path)
+
+
+def _echo_result(result) -> None:
+    typer.echo(f"{result.action}: {result.target_id}")
+    if result.detail:
+        typer.echo(f"  {result.detail}")
+    if result.entity_rendered:
+        verb = ("queued a proposal for" if result.queued_for_review
+                else "re-rendered")
+        typer.echo(f"  {verb} entity {result.entity_rendered}")
+    for w in result.warnings:
+        typer.echo(f"  ! {w}", err=True)
+
+
+@review_app.command("list")
+def review_list_cmd(
+    wiki: Optional[str] = typer.Option(None, "--wiki", "-w"),
+):
+    """Show everything awaiting a human decision: conflicts, duplicate
+    candidates, unreviewed counts, and any queued proposals."""
+    from synthadoc.kb import review as kb_review
+    layout, _ = _review_ctx(wiki)
+
+    async def _run():
+        db = KBDB(layout.db_path)
+        await db.init()
+        return await kb_review.gather_pending(db, layout)
+
+    p = asyncio.run(_run())
+
+    typer.echo("Unreviewed:")
+    typer.echo(f"  facts      {p.facts_unreviewed}")
+    typer.echo(f"  decisions  {p.decisions_unreviewed}")
+    typer.echo(f"  entities   {p.entities_unreviewed}")
+
+    typer.echo(f"\nConflicts ({len(p.conflicts)}) - resolve with `kb review reject <fact-id>`:")
+    for c in p.conflicts:
+        typer.echo(f"  - {c.entity_id} | {c.fact_type} @ {c.valid_at}")
+        typer.echo(f"      values: {', '.join(repr(v) for v in c.values)}")
+        for fid in c.fact_ids:
+            typer.echo(f"        {fid}")
+
+    typer.echo(f"\nDuplicate candidates ({len(p.duplicates)}) - merge with "
+               f"`kb review merge <dup-id> --into <keeper-id>`:")
+    for d in p.duplicates:
+        typer.echo(f"  - [{d.entity_type}] {d.a_id}  <->  {d.b_id}  ({d.reason})")
+
+    if p.review_queue_has_entries:
+        typer.echo(f"\nQueued proposals against reviewed pages: {p.review_queue_path}")
+    typer.echo("\nFull reports under kb/maintenance/.")
+
+
+@review_app.command("reject")
+def review_reject_cmd(
+    fact_id: str = typer.Argument(..., help="Fact id to reject"),
+    wiki: Optional[str] = typer.Option(None, "--wiki", "-w"),
+):
+    """Reject a fact so the resolver ignores it everywhere, then re-render
+    its entity. Use this to resolve a conflict by dropping the wrong value."""
+    from synthadoc.kb import review as kb_review
+    layout, rules = _review_ctx(wiki)
+
+    async def _run():
+        db = KBDB(layout.db_path)
+        await db.init()
+        return await kb_review.reject_fact(db, layout, rules, fact_id)
+
+    try:
+        _echo_result(asyncio.run(_run()))
+    except KeyError as exc:
+        E.cli_error(E.WIKI_INVALID, str(exc), "Check the fact id with `kb review list`.")
+
+
+@review_app.command("accept-fact")
+def review_accept_fact_cmd(
+    fact_id: str = typer.Argument(..., help="Fact id to confirm"),
+    wiki: Optional[str] = typer.Option(None, "--wiki", "-w"),
+):
+    """Mark a single fact reviewed (confirms it; does not lock the page)."""
+    from synthadoc.kb import review as kb_review
+    layout, rules = _review_ctx(wiki)
+
+    async def _run():
+        db = KBDB(layout.db_path)
+        await db.init()
+        return await kb_review.accept_fact(db, layout, rules, fact_id)
+
+    try:
+        _echo_result(asyncio.run(_run()))
+    except KeyError as exc:
+        E.cli_error(E.WIKI_INVALID, str(exc), "Check the fact id with `kb review list`.")
+
+
+@review_app.command("accept")
+def review_accept_cmd(
+    entity_id: str = typer.Argument(..., help="Entity id to lock as reviewed"),
+    wiki: Optional[str] = typer.Option(None, "--wiki", "-w"),
+):
+    """Lock an entity's current state as reviewed. Future contradicting facts
+    are then queued in kb/maintenance/review_queue.md instead of auto-applied."""
+    from synthadoc.kb import review as kb_review
+    layout, rules = _review_ctx(wiki)
+
+    async def _run():
+        db = KBDB(layout.db_path)
+        await db.init()
+        return await kb_review.set_entity_reviewed(db, layout, rules, entity_id, reviewed=True)
+
+    try:
+        _echo_result(asyncio.run(_run()))
+    except KeyError as exc:
+        E.cli_error(E.WIKI_INVALID, str(exc), "Check the entity id with `kb review list`.")
+
+
+@review_app.command("reopen")
+def review_reopen_cmd(
+    entity_id: str = typer.Argument(..., help="Entity id to unlock"),
+    wiki: Optional[str] = typer.Option(None, "--wiki", "-w"),
+):
+    """Unlock a reviewed entity so its page is auto-rendered again."""
+    from synthadoc.kb import review as kb_review
+    layout, rules = _review_ctx(wiki)
+
+    async def _run():
+        db = KBDB(layout.db_path)
+        await db.init()
+        return await kb_review.set_entity_reviewed(db, layout, rules, entity_id, reviewed=False)
+
+    try:
+        _echo_result(asyncio.run(_run()))
+    except KeyError as exc:
+        E.cli_error(E.WIKI_INVALID, str(exc), "Check the entity id with `kb review list`.")
+
+
+@review_app.command("merge")
+def review_merge_cmd(
+    dup_id: str = typer.Argument(..., help="Duplicate entity id to merge away"),
+    into_id: str = typer.Option(..., "--into", help="Keeper entity id"),
+    wiki: Optional[str] = typer.Option(None, "--wiki", "-w"),
+):
+    """Merge a duplicate entity into a keeper: its facts/decisions/unknowns
+    move to the keeper, the keeper page is re-rendered, and the duplicate
+    becomes a tombstone."""
+    from synthadoc.kb import review as kb_review
+    layout, rules = _review_ctx(wiki)
+
+    async def _run():
+        db = KBDB(layout.db_path)
+        await db.init()
+        return await kb_review.merge_entity(db, layout, rules, dup_id, into_id)
+
+    try:
+        _echo_result(asyncio.run(_run()))
+    except (KeyError, ValueError) as exc:
+        E.cli_error(E.WIKI_INVALID, str(exc), "Check ids with `kb review list`.")
+
+
 # Attach to the root app — done at import time by main.py
 app.add_typer(kb_app)

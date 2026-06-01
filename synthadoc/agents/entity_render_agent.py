@@ -72,7 +72,12 @@ class EntityRenderAgent:
         if entity is None:
             raise KeyError(f"entity {entity_id!r} not found in kb.db")
 
-        facts = await self._db.list_facts(entity_id=entity_id)
+        # Rejected facts are kept in the DB as evidence but must not appear in
+        # any rendered section (current state, history, or recent changes).
+        facts = [
+            f for f in await self._db.list_facts(entity_id=entity_id)
+            if f.get("review_status") != "rejected"
+        ]
         if not facts:
             return RenderResult(
                 entity_id=entity_id,

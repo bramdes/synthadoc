@@ -152,6 +152,14 @@ synthadoc kb relink
 
 # Run every maintenance job + emit kb_health.md
 synthadoc kb maintenance run [--skip-histories]
+
+# Triage the review queue (see "Reviewing the KB" below)
+synthadoc kb review list                     # what's awaiting a decision
+synthadoc kb review reject <fact-id>         # drop a wrong fact, re-render
+synthadoc kb review accept-fact <fact-id>    # confirm a single fact
+synthadoc kb review accept <entity-id>       # lock an entity's page as reviewed
+synthadoc kb review reopen <entity-id>       # unlock it again
+synthadoc kb review merge <dup-id> --into <keeper-id>   # merge duplicates
 ```
 
 `--skip-histories` is a perf knob — `history.md` re-render is the
@@ -183,67 +191,105 @@ synthadoc kb import-source ./meeting.md --type meeting_transcript
 #   kb/entities/projects/<slug>/history.md         — full chronology
 ```
 
-### Pinning a reviewed entity page
-
-By default the entity-render agent overwrites `index.md` on every
-pipeline run. Once you've curated a page by hand, mark it reviewed so
-future updates land in the review queue instead:
-
-```yaml
-# kb/entities/projects/x/index.md
 ---
-id: entity.project.x
-type: entity
-entity_type: project
-status: active
-current_state_review_status: reviewed   # ← changed from 'unreviewed'
-last_reviewed: 2026-05-24
----
+
+## Reviewing the KB
+
+Everything the fact tier extracts starts as `review_status: unreviewed`.
+Review is how a human triages it: drop wrong facts, merge duplicate
+entities, and lock pages you've curated. The `synthadoc kb review`
+command group does this **end to end** — it updates both `kb.db` and the
+markdown frontmatter, then re-resolves and re-renders the affected
+pages so the effect is immediate.
+
+> **Why a command and not a text edit?** `kb.db` is the working store the
+> renderer reads from; the markdown is the durable truth a rebuild
+> restores from. Hand-editing a `review_status:` line in a `.md` file
+> changes only one of the two and is silently overwritten on the next
+> render. Always go through `kb review`, which keeps both in sync.
+
+### See what's pending
+
+```bash
+synthadoc kb review list
 ```
 
-After this change, every subsequent pipeline run writes its proposed
-update to `kb/maintenance/review_queue.md` instead of overwriting the
-index page. Review the queue, copy the relevant block back into the
-index, and reset `current_state_review_status: unreviewed` if you want
-auto-renders to resume.
+Prints, in one place:
 
-### Resolving a contradiction
+- **Unreviewed counts** — facts / decisions / entities still untriaged.
+- **Conflicts** — each with the participating fact ids, ready to paste
+  into `kb review reject`.
+- **Duplicate candidates** — each pair, ready for `kb review merge`.
+- **Queued proposals** — if any reviewed page has pending changes in
+  `kb/maintenance/review_queue.md`.
+
+It also refreshes `conflicts.md` and `duplicate_entities.md` as a side
+effect. The full reports stay under `kb/maintenance/`.
+
+### Resolve a contradiction
 
 `conflicts.md` lists two-or-more active facts disagreeing at the same
-`(entity, fact_type, valid_at)`. To resolve:
+`(entity, fact_type, valid_at)`. Look at each fact's `source_quote`,
+decide which is wrong, and reject it by id:
 
-1. Open each candidate fact under `kb/facts/`.
-2. Inspect the `source_quote` and decide which is correct.
-3. Mark the rejected fact:
-
-   ```yaml
-   # kb/facts/projects/x/project.status/<date>-<value>.md
-   ---
-   ...
-   review_status: rejected   # ← from 'unreviewed'
-   ---
-   ```
-
-4. Re-run `synthadoc kb maintenance run`. The resolver excludes rejected
-   facts from current-state resolution; the conflict report clears.
-
-The losing fact stays on disk — supersession is a relationship, not
-deletion. The history.md page will still surface it.
-
-### Merging duplicate entity candidates
-
-`duplicate_entities.md` flags suspicious entity pairs by slug
-similarity (noise tokens, substrings, Levenshtein ≤ 2). The detector
-never auto-merges. To merge manually:
-
-```sql
--- Pick the canonical entity, point the duplicate at it
-UPDATE entities SET merged_into = 'entity.project.canonical-slug'
-WHERE id = 'entity.project.duplicate-slug';
+```bash
+synthadoc kb review reject fact.project.document-intelligence.project.milestone.2026-05-22-2
 ```
 
-Future link-following + render logic will chase `merged_into` (currently
-it's stored but not yet followed by the render agents — Layer 4 work).
+This marks the fact `rejected` in `kb.db` **and** in its markdown
+frontmatter, then re-resolves and re-renders the entity page. A rejected
+fact is excluded from **every** resolution strategy — including
+`append_only` and `requires_review` — so the value disappears from the
+entity page and the conflict clears. The fact stays on disk as evidence
+(it still appears on `history.md`); it just no longer counts.
+
+To simply confirm a fact is correct (without changing the page), use
+`synthadoc kb review accept-fact <fact-id>`.
+
+### Lock a reviewed entity page
+
+By default the render agent overwrites `index.md` on every pipeline run.
+Once a page is correct, lock it:
+
+```bash
+synthadoc kb review accept entity.project.document-intelligence
+```
+
+This renders the current page, then sets
+`current_state_review_status: reviewed` (DB + frontmatter) and stamps
+`last_reviewed`. From now on, any new contradicting fact is appended to
+`kb/maintenance/review_queue.md` as a *proposed update* instead of
+silently overwriting your page. To resume auto-rendering:
+
+```bash
+synthadoc kb review reopen entity.project.document-intelligence
+```
+
+### Merge duplicate entities
+
+`duplicate_entities.md` flags suspicious pairs by slug similarity (noise
+tokens, substrings, Levenshtein ≤ 2). It never auto-merges. Pick the
+keeper and merge the duplicate into it:
+
+```bash
+synthadoc kb review merge entity.project.doc-intel-enterprise-roadmap \
+   --into entity.project.doc-intel
+```
+
+This re-points the duplicate's facts, decisions, and unknowns to the
+keeper, marks the duplicate `merged` (with `merged_into` set), re-renders
+the keeper page so the moved facts show up, and rewrites the duplicate's
+page as a tombstone pointing at the keeper.
+
+### Suggested cadence
+
+```bash
+synthadoc kb maintenance run      # recompute health + reports
+synthadoc kb review list          # see conflicts / duplicates / counts
+synthadoc kb review reject …      # resolve each conflict
+synthadoc kb review merge …       # collapse each real duplicate
+synthadoc kb review accept …      # lock pages you've curated
+```
 
 ---
 
