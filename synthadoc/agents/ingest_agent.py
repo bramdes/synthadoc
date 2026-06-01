@@ -663,11 +663,22 @@ class IngestAgent:
 
     @staticmethod
     def _stamp_provenance(content: str, source_label: str, source_date: str) -> str:
-        """Append a one-line provenance footer unless the LLM already added one."""
+        """Append a one-line provenance footer unless the LLM already added one.
+
+        File-backed sources are wrapped as an Obsidian `[[wikilink]]` so the
+        footer links straight to the copy of the raw source under raw_sources/
+        (Obsidian resolves wikilinks by basename, regardless of folder). URL
+        sources and any label carrying wikilink-breaking characters (`[]|#`)
+        are left as plain text.
+        """
         tail = content[-200:]
         if "_— Source:" in tail:
             return content
-        return content.rstrip() + f"\n\n_— Source: {source_label} · {source_date}_"
+        label = source_label
+        is_url = source_label.startswith(("http://", "https://"))
+        if not is_url and not any(c in source_label for c in "[]|#"):
+            label = f"[[{source_label}]]"
+        return content.rstrip() + f"\n\n_— Source: {label} · {source_date}_"
 
     @staticmethod
     def _title_from_page_content(body: str) -> str:
