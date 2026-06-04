@@ -8,16 +8,21 @@ A fact arrives carrying the name of its subject ("Document Intelligence",
 resolution. Behaviour for v0.3:
 
 1. Slugify the name.
-2. If an entity row exists with that ``(entity_type, slug)``, return it.
+2. If an entity row exists with that ``(entity_type, slug)``, return it —
+   following ``merged_into`` to the canonical entity if it was merged.
 3. If ``auto_create`` is True (default), insert a new entity row and
    return its id.
 4. Otherwise return ``None`` and let the caller decide.
+
+``merged_into`` chasing is what makes ``synthadoc kb review merge`` durable:
+once a duplicate slug (e.g. ``aura-program``) is merged into a canonical
+entity (``aura``), every future fact that resolves to that slug is attached
+to the canonical entity instead of re-fragmenting it.
 
 Open follow-ups (Layer 3):
 
 - BM25 fuzzy matching against existing entity names.
 - LLM tie-breaker for ambiguous candidates.
-- ``entities.merged_into`` chasing so callers don't see merged dupes.
 
 Those are explicitly deferred. The pure-deterministic linker is enough to
 get a working pipeline and a deterministic test corpus.
@@ -28,6 +33,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Optional
 
+from synthadoc.kb import aliases as _aliases
 from synthadoc.kb import ids as _ids
 from synthadoc.kb.db import KBDB
 from synthadoc.kb.layout import KBLayout
@@ -47,6 +53,9 @@ class EntityLinker:
     def __init__(self, db: KBDB, layout: KBLayout) -> None:
         self._db = db
         self._layout = layout
+        # Declared aliases (kb_aliases.yaml) are applied during import so
+        # variant names resolve to the canonical entity from the start.
+        self._aliases = _aliases.load(layout.aliases_path)
 
     async def resolve(
         self,
@@ -69,11 +78,20 @@ class EntityLinker:
             raise ValueError("name must be non-empty")
 
         slug = _ids.slugify(name)
+
+        # Apply declared aliases first: a variant name/slug is rewritten to the
+        # canonical (name, slug) before any DB work, so the fact attaches to the
+        # canonical entity and a duplicate is never created.
+        canonical = self._aliases.resolve(entity_type, slug)
+        if canonical is not None:
+            name = canonical.name
+            slug = canonical.slug
+
         eid = _ids.entity_id(entity_type, slug)
 
         existing = await self._db.get_entity(eid)
         if existing is not None:
-            return LinkResult(entity_id=eid, created=False)
+            return LinkResult(entity_id=await self._canonical(eid), created=False)
 
         # Also check by (entity_type, slug) in case a future caller constructs
         # the id differently. With the current generator this is the same lookup,
@@ -83,7 +101,7 @@ class EntityLinker:
             (entity_type, slug),
         )
         if rows:
-            return LinkResult(entity_id=rows[0]["id"], created=False)
+            return LinkResult(entity_id=await self._canonical(rows[0]["id"]), created=False)
 
         if not auto_create:
             return None
@@ -101,6 +119,21 @@ class EntityLinker:
             path=path,
         )
         return LinkResult(entity_id=eid, created=True)
+
+    async def _canonical(self, eid: str) -> str:
+        """Follow the ``merged_into`` chain to the surviving entity id.
+
+        Returns *eid* unchanged when it was never merged. Guards against
+        cycles (a self- or mutual-merge can't loop forever)."""
+        seen: set[str] = set()
+        cur = eid
+        while cur and cur not in seen:
+            seen.add(cur)
+            row = await self._db.get_entity(cur)
+            if row is None or not row.get("merged_into"):
+                break
+            cur = row["merged_into"]
+        return cur
 
     async def resolve_many(
         self,

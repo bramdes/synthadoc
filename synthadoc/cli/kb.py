@@ -92,6 +92,32 @@ resolution_rules:
 """
 
 
+# Default kb_aliases.yaml — version-controllable entity merge map. Empty by
+# default; populated by `synthadoc kb review merge` / `kb review alias`, or by
+# hand. Applied by the EntityLinker during import so duplicates never form.
+_DEFAULT_KB_ALIASES = """\
+# Entity aliases for the temporal KB. Declares that several names are the SAME
+# entity; applied during import so duplicates never form. Commit this file with
+# your wiki — it survives a clean re-import (unlike merges stored in kb.db).
+#
+# Canonical display name is the key; aliases may be names or slugs (both are
+# slugified on load). Example:
+#
+# aliases:
+#   project:
+#     AURA:
+#       - AURA Program
+#       - AURA EGP Program
+#   person:
+#     Harsh:
+#       - hash
+#
+# Managed by `synthadoc kb review merge` and `synthadoc kb review alias`.
+
+aliases: {}
+"""
+
+
 # Stub bodies for the maintenance pages — created empty so they show up in
 # the wiki immediately even before any job has run.
 _MAINTENANCE_STUBS = {
@@ -152,6 +178,10 @@ def init_cmd(
     # kb_config.yaml — only write if missing so user edits survive re-init
     if not layout.config_path.exists():
         layout.config_path.write_text(_DEFAULT_KB_CONFIG, encoding="utf-8", newline="\n")
+
+    # kb_aliases.yaml — version-controllable entity merge map (see _DEFAULT_KB_ALIASES)
+    if not layout.aliases_path.exists():
+        layout.aliases_path.write_text(_DEFAULT_KB_ALIASES, encoding="utf-8", newline="\n")
 
     # Create kb.db
     async def _init_db():
@@ -579,6 +609,35 @@ def review_reopen_cmd(
         _echo_result(asyncio.run(_run()))
     except KeyError as exc:
         E.cli_error(E.WIKI_INVALID, str(exc), "Check the entity id with `kb review list`.")
+
+
+@review_app.command("alias")
+def review_alias_cmd(
+    alias: str = typer.Argument(..., help="Variant name to fold in, e.g. 'AURA Program'"),
+    into: str = typer.Option(..., "--into", help="Canonical name, e.g. 'AURA'"),
+    entity_type: str = typer.Option(..., "--type", "-t",
+        help="Entity type: project | person | topic | requirement"),
+    wiki: Optional[str] = typer.Option(None, "--wiki", "-w"),
+):
+    """Declare that two names are the same entity, in kb_aliases.yaml.
+
+    Unlike `merge`, this needs no existing entities — use it to pre-seed
+    aliases before a fresh import so duplicates never form. The file is
+    version-controllable (lives at the wiki root, beside kb_config.yaml)."""
+    from synthadoc.kb import aliases as kb_aliases
+    root = _resolve_wiki_root(wiki)
+    layout = KBLayout(root)
+    try:
+        kb_aliases.add_alias(
+            layout.aliases_path, entity_type=entity_type,
+            canonical_name=into, alias_name=alias,
+        )
+    except kb_aliases.AliasError as exc:
+        E.cli_error(E.WIKI_INVALID, str(exc),
+                    "Valid types: project, person, topic, requirement.")
+    typer.echo(f"alias: '{alias}' -> '{into}' [{entity_type}]")
+    typer.echo(f"  recorded in {layout.aliases_path}")
+    typer.echo("  applied on the next import (restart `synthadoc serve` to pick it up).")
 
 
 @review_app.command("merge")

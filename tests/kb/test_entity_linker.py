@@ -117,3 +117,46 @@ async def test_resolve_many_skips_when_no_auto_create(linker):
     )
     assert len(results) == 1
     assert results[0].entity_id == ids.entity_id("project", "known")
+
+
+async def test_resolve_follows_merged_into(linker):
+    """A merged duplicate slug resolves to the canonical keeper, so future
+    facts attach to the keeper instead of re-creating the duplicate."""
+    el, db = linker
+    keeper = await el.resolve(name="AURA", entity_type="project")
+    dup = await el.resolve(name="AURA Program", entity_type="project")
+    assert dup.entity_id != keeper.entity_id
+
+    # Simulate `kb review merge AURA Program --into AURA`
+    await db.execute(
+        "UPDATE entities SET merged_into=?, status='merged' WHERE id=?",
+        (keeper.entity_id, dup.entity_id),
+    )
+
+    again = await el.resolve(name="AURA Program", entity_type="project")
+    assert again.entity_id == keeper.entity_id
+    assert again.created is False
+
+
+async def test_resolve_follows_multi_hop_merge_chain(linker):
+    el, db = linker
+    a = await el.resolve(name="AURA Program", entity_type="project")
+    b = await el.resolve(name="AURA EGP Program", entity_type="project")
+    c = await el.resolve(name="AURA", entity_type="project")
+    # a -> b -> c
+    await db.execute("UPDATE entities SET merged_into=? WHERE id=?", (b.entity_id, a.entity_id))
+    await db.execute("UPDATE entities SET merged_into=? WHERE id=?", (c.entity_id, b.entity_id))
+    resolved = await el.resolve(name="AURA Program", entity_type="project")
+    assert resolved.entity_id == c.entity_id
+
+
+async def test_resolve_merge_cycle_is_safe(linker):
+    """A pathological mutual merge must not loop forever."""
+    el, db = linker
+    a = await el.resolve(name="One", entity_type="project")
+    b = await el.resolve(name="Two", entity_type="project")
+    await db.execute("UPDATE entities SET merged_into=? WHERE id=?", (b.entity_id, a.entity_id))
+    await db.execute("UPDATE entities SET merged_into=? WHERE id=?", (a.entity_id, b.entity_id))
+    # Should terminate and return one of them, not hang.
+    resolved = await el.resolve(name="One", entity_type="project")
+    assert resolved.entity_id in (a.entity_id, b.entity_id)

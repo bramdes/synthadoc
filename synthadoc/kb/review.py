@@ -267,14 +267,24 @@ async def merge_entity(
     await resolve_db(db, rules)
     rr = await _rerender_entity(db, layout, rules, into_id)
 
-    # Tombstone the duplicate's page (text-only reference — entity index pages
-    # are all named index.md, so a [[wikilink]] by basename would be ambiguous).
+    # Record the merge in the version-controlled alias file so it is durable:
+    # a re-import (even after a wipe) re-applies it from the start.
     result = ReviewResult(
         action="merge", target_id=dup_id,
         detail=f"into {into_id} ({keeper.get('name', '')})",
         entity_rendered=into_id,
         queued_for_review=bool(rr and rr.queued_for_review),
     )
+    try:
+        from synthadoc.kb import aliases as _aliases
+        _aliases.add_alias(
+            layout.aliases_path,
+            entity_type=dup["entity_type"],
+            canonical_name=keeper.get("name") or keeper["slug"],
+            alias_name=dup.get("name") or dup["slug"],
+        )
+    except Exception as exc:
+        result.warnings.append(f"could not record alias: {exc}")
     try:
         idx = layout.entity_index_path(dup["entity_type"], dup["slug"])
         data = fm.build_entity(
