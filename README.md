@@ -58,6 +58,7 @@ and built per
 | Pipeline | After every successful `synthadoc ingest`, a `kb_pipeline` job runs: SourceSummary → FactExtract → DecisionExtract → UnknownExtract → resolve → EntityRender. Best-effort, non-fatal — page-tier ingest is never blocked. |
 | Maintenance | `synthadoc kb maintenance run` → conflicts, stale pages, orphan facts, facts-without-evidence, conclusions-without-basis, duplicate entities, broken links, people-page §3.7 safety. Reports under `kb/maintenance/`. |
 | Review | `synthadoc kb review list / reject / accept-fact / accept / reopen / merge` — human triage of conflicts, duplicates, and reviewed-page locks. Each action updates `kb.db` **and** the markdown, then re-resolves + re-renders. A rejected fact is excluded from every resolution strategy. |
+| Entity curation | Version-controlled `kb_aliases.yaml` (same-entity merges) and `kb_relations.yaml` (parent/sub-area links) at the wiki root — committable, survive a re-import. Aliases are applied by the linker *during import* so duplicates never form; sub-areas render as a "Sub-areas" list / "Part of" line. Manage via `kb review alias` / `kb review relate` (or `merge`, which records an alias). |
 | Determinism | Substring-quote guard on every extracted fact (paraphrased quotes are rejected without retry). Closed vocabularies for `entity_type` / `fact_type` / `authority` / `confidence` / `review_status`. Pure resolver with `latest_valid_at_wins` / `append_only` / `requires_review` strategies. |
 | Cost guard | `[ingest] max_tokens_per_fact_extract = N` caps runaway extraction per source. |
 | Telemetry | Per-maintenance-job OTel spans (`kb.maintenance.<name>`) land in `.synthadoc/logs/traces.jsonl`. |
@@ -201,6 +202,10 @@ synthadoc kb review list -w <name>            # what's awaiting a decision
 synthadoc kb review reject <fact-id> -w <name>
 synthadoc kb review merge <dup-id> --into <keeper-id> -w <name>
 synthadoc kb review accept <entity-id> -w <name>    # lock a curated page (reopen to unlock)
+
+# Durable, version-controlled entity curation (kb_aliases.yaml / kb_relations.yaml)
+synthadoc kb review alias "<variant>" --into "<canonical>" --type <t> -w <name>   # same entity
+synthadoc kb review relate "<child>" --parent "<parent>" --type <t> -w <name>     # sub-area of
 ```
 
 ---

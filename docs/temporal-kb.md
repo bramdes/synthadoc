@@ -160,6 +160,10 @@ synthadoc kb review accept-fact <fact-id>    # confirm a single fact
 synthadoc kb review accept <entity-id>       # lock an entity's page as reviewed
 synthadoc kb review reopen <entity-id>       # unlock it again
 synthadoc kb review merge <dup-id> --into <keeper-id>   # merge duplicates
+
+# Durable, version-controlled entity curation (see "Curating entities durably")
+synthadoc kb review alias "<variant>" --into "<canonical>" --type <t>   # same entity
+synthadoc kb review relate "<child>" --parent "<parent>" --type <t>     # sub-area of
 ```
 
 `--skip-histories` is a perf knob — `history.md` re-render is the
