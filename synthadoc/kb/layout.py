@@ -39,6 +39,8 @@ KB_CONFIG_PATH = "kb_config.yaml"
 # the wiki root — NOT under .synthadoc/ — so it can be committed alongside the
 # wiki and survives a reset/re-import.
 KB_ALIASES_PATH = "kb_aliases.yaml"
+# Version-controllable parent/sub-area relationship map (same rationale).
+KB_RELATIONS_PATH = "kb_relations.yaml"
 
 # Per-source-type subfolder names. Mirrors the alias used in source IDs so
 # folder names match the human-visible ID.
@@ -98,6 +100,10 @@ class KBLayout:
     @property
     def aliases_path(self) -> Path:
         return self.root / KB_ALIASES_PATH
+
+    @property
+    def relations_path(self) -> Path:
+        return self.root / KB_RELATIONS_PATH
 
     @property
     def maintenance_dir(self) -> Path:

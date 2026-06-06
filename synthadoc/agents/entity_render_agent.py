@@ -28,6 +28,7 @@ from typing import Optional
 
 from synthadoc.kb import frontmatter as fm
 from synthadoc.kb import ids
+from synthadoc.kb import relations as _relations
 from synthadoc.kb.db import KBDB
 from synthadoc.kb.layout import KBLayout
 from synthadoc.kb.links import emit_links
@@ -60,6 +61,9 @@ class EntityRenderAgent:
         self._db = db
         self._layout = layout
         self._rules = rules
+        # Declared parent/sub-area relationships (kb_relations.yaml). Reloaded
+        # per agent construction so hand-edits take effect on the next render.
+        self._relations = _relations.load(layout.relations_path)
 
     # ------------------------------------------------------------------
 
@@ -104,7 +108,11 @@ class EntityRenderAgent:
             )
 
         # Free write — entity hasn't been reviewed yet.
-        body = _render_body(entity=entity, state=state, facts=facts)
+        part_of, subareas = await self._relationship_links(entity)
+        body = _render_body(
+            entity=entity, state=state, facts=facts,
+            part_of=part_of, subareas=subareas,
+        )
         data = fm.build_entity(
             id=entity_id,
             entity_type=entity["entity_type"],
@@ -137,6 +145,49 @@ class EntityRenderAgent:
     def _entity_path(self, entity: dict) -> Path:
         return self._layout.entity_index_path(entity["entity_type"], entity["slug"])
 
+    def _entity_link(self, entity_type: str, slug: str, name: str) -> str:
+        """A path-based wikilink to an entity's index page.
+
+        Entity pages are all named ``index.md``, so a basename ``[[slug]]``
+        link is ambiguous and won't resolve. A path link with a display alias
+        navigates correctly in Obsidian (and `broken_links` understands the
+        path form)."""
+        rel = str(
+            self._layout.entity_index_path(entity_type, slug)
+            .relative_to(self._layout.root)
+        ).replace("\\", "/")
+        if rel.endswith(".md"):
+            rel = rel[:-3]
+        return f"[[{rel}|{name}]]"
+
+    async def _display_name(self, entity_type: str, slug: str) -> str:
+        """Display name for a (type, slug) — the entity's name if it exists,
+        else a title-cased fall-back from the slug."""
+        row = await self._db.get_entity(ids.entity_id(entity_type, slug))
+        if row and row.get("name"):
+            return row["name"]
+        return slug.replace("-", " ")
+
+    async def _relationship_links(self, entity: dict) -> tuple[Optional[str], list[str]]:
+        """Return (part_of_link, [subarea_links]) for this entity from the
+        declared kb_relations.yaml map."""
+        etype = entity["entity_type"]
+        slug = entity["slug"]
+        part_of = None
+        parent_slug = self._relations.parent_of(etype, slug)
+        if parent_slug:
+            part_of = self._entity_link(
+                etype, parent_slug, await self._display_name(etype, parent_slug)
+            )
+        subareas = []
+        for child_slug in self._relations.children_of(etype, slug):
+            subareas.append(
+                self._entity_link(
+                    etype, child_slug, await self._display_name(etype, child_slug)
+                )
+            )
+        return part_of, subareas
+
     async def _queue_proposal(
         self, entity: dict, state: ResolvedState, facts: list[dict],
     ) -> Path:
@@ -159,10 +210,18 @@ class EntityRenderAgent:
 # ---------------------------------------------------------------------------
 
 
-def _render_body(*, entity: dict, state: ResolvedState, facts: list[dict]) -> str:
+def _render_body(
+    *, entity: dict, state: ResolvedState, facts: list[dict],
+    part_of: Optional[str] = None, subareas: Optional[list[str]] = None,
+) -> str:
     name = entity["name"]
     fact_by_id = {f["id"]: f for f in facts}
     lines: list[str] = [f"# {name}", ""]
+
+    # Part of — parent entity, when this entity is a declared sub-area.
+    if part_of:
+        lines.append(f"_Part of {part_of}_")
+        lines.append("")
 
     # Summary — one-line synthesis from current state
     lines.append("## Current Summary")
@@ -189,6 +248,14 @@ def _render_body(*, entity: dict, state: ResolvedState, facts: list[dict]) -> st
     else:
         lines.append("| _none_ | | | | |")
     lines.append("")
+
+    # Sub-areas — child entities declared in kb_relations.yaml.
+    if subareas:
+        lines.append("## Sub-areas")
+        lines.append("")
+        for link in subareas:
+            lines.append(f"- {link}")
+        lines.append("")
 
     # Append-only series — milestones, decisions made, etc.
     if state.appended:

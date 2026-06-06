@@ -44,20 +44,30 @@ class BrokenLinksResult:
 
 async def run(db: KBDB, layout: KBLayout) -> BrokenLinksResult:
     """Detect wikilinks whose target slug has no on-disk markdown file."""
-    # Build the slug → path index in one walk
+    # Build the slug → path index in one walk. We also index full
+    # project-root-relative paths (with and without the .md suffix) so that
+    # path-style wikilinks — e.g. `[[kb/entities/projects/doc-intel/index]]`,
+    # the only form that resolves to an entity page (all named index.md) — are
+    # recognised instead of flagged as broken.
     slug_paths: dict[str, list[str]] = {}
+    rel_paths: set[str] = set()
+
+    def _index(path: Path) -> None:
+        slug = path.stem
+        rel = str(path.relative_to(layout.root)).replace("\\", "/")
+        slug_paths.setdefault(slug, []).append(rel)
+        rel_paths.add(rel)
+        if rel.endswith(".md"):
+            rel_paths.add(rel[:-3])
+
     if layout.kb.exists():
         for path in layout.kb.rglob("*.md"):
-            slug = path.stem
-            rel = str(path.relative_to(layout.root)).replace("\\", "/")
-            slug_paths.setdefault(slug, []).append(rel)
+            _index(path)
     # The wiki/ tree also resolves slugs — readers care about either tree.
     wiki_dir = layout.root / "wiki"
     if wiki_dir.exists():
         for path in wiki_dir.rglob("*.md"):
-            slug = path.stem
-            rel = str(path.relative_to(layout.root)).replace("\\", "/")
-            slug_paths.setdefault(slug, []).append(rel)
+            _index(path)
 
     rows = await db.fetchall(
         "SELECT from_path, to_path FROM links WHERE link_type = ? "
@@ -67,7 +77,7 @@ async def run(db: KBDB, layout: KBLayout) -> BrokenLinksResult:
     broken = [
         BrokenLink(from_path=r["from_path"], to_path=r["to_path"])
         for r in rows
-        if r["to_path"] not in slug_paths
+        if r["to_path"] not in slug_paths and r["to_path"] not in rel_paths
     ]
 
     path = layout.maintenance_dir / REPORT_FILENAME

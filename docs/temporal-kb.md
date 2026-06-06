@@ -279,7 +279,57 @@ synthadoc kb review merge entity.project.doc-intel-enterprise-roadmap \
 This re-points the duplicate's facts, decisions, and unknowns to the
 keeper, marks the duplicate `merged` (with `merged_into` set), re-renders
 the keeper page so the moved facts show up, and rewrites the duplicate's
-page as a tombstone pointing at the keeper.
+page as a tombstone pointing at the keeper. **It also records the merge in
+`kb_aliases.yaml`** (see below) so it survives a re-import.
+
+### Curating entities durably: aliases & sub-areas
+
+Two version-controllable files at the wiki root (siblings of
+`kb_config.yaml`, **not** under `.synthadoc/`, so they commit with the wiki
+and survive a clean re-import) let you teach the system about your entities
+once and have it apply on every import:
+
+**`kb_aliases.yaml` — "these names are the SAME entity."** Applied by the
+`EntityLinker` *during import*, so declared variants never fragment in the
+first place. The merge above writes here automatically; you can also
+pre-seed before an import (no existing entity required):
+
+```bash
+synthadoc kb review alias "AURA Program" --into "AURA" --type project
+synthadoc kb review alias "Cloud Code"  --into "Claude Code" --type project
+```
+```yaml
+# kb_aliases.yaml
+aliases:
+  project:
+    AURA:
+      - AURA Program
+      - AURA EGP Program
+```
+
+**`kb_relations.yaml` — "this entity is a SUB-AREA of that one."** Keeps both
+entities but records a parent/child link. The entity renderer shows a
+`## Sub-areas` list on the parent and a `_Part of …_` line on each child
+(path-style wikilinks, since entity pages are all `index.md`):
+
+```bash
+synthadoc kb review relate "Doc Intel intent extraction" --parent "Doc Intel" --type project
+```
+```yaml
+# kb_relations.yaml
+relations:
+  project:
+    Doc Intel:
+      - Doc Intel intent extraction
+      - Doc Intel ITC / Production Deployment
+```
+
+Both files are also created (empty, documented) by `synthadoc kb init`, and
+are hand-editable. The linker reads them on each pipeline run, so edits take
+effect on the **next import** — restart `synthadoc serve` once after
+upgrading so it loads the current code, then re-imports pick them up
+automatically. (Aliases apply at link time; relationships surface the next
+time the affected entity pages are rendered.)
 
 ### Suggested cadence
 

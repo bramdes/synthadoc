@@ -118,6 +118,27 @@ aliases: {}
 """
 
 
+# Default kb_relations.yaml — version-controllable parent/sub-area map. Empty
+# by default; populated by `synthadoc kb review relate` or by hand. Surfaced on
+# entity pages as a "Sub-areas" list (parent) and "Part of" line (child).
+_DEFAULT_KB_RELATIONS = """\
+# Entity relationships for the temporal KB. Declares parent -> sub-area
+# ('part of') links, surfaced on entity pages. Commit this file with your wiki.
+#
+# Parent display name is the key; children may be names or slugs. Example:
+#
+# relations:
+#   project:
+#     Doc Intel:
+#       - Doc Intel intent extraction
+#       - Doc Intel ITC / Production Deployment
+#
+# Managed by `synthadoc kb review relate`.
+
+relations: {}
+"""
+
+
 # Stub bodies for the maintenance pages — created empty so they show up in
 # the wiki immediately even before any job has run.
 _MAINTENANCE_STUBS = {
@@ -182,6 +203,10 @@ def init_cmd(
     # kb_aliases.yaml — version-controllable entity merge map (see _DEFAULT_KB_ALIASES)
     if not layout.aliases_path.exists():
         layout.aliases_path.write_text(_DEFAULT_KB_ALIASES, encoding="utf-8", newline="\n")
+
+    # kb_relations.yaml — version-controllable parent/sub-area map
+    if not layout.relations_path.exists():
+        layout.relations_path.write_text(_DEFAULT_KB_RELATIONS, encoding="utf-8", newline="\n")
 
     # Create kb.db
     async def _init_db():
@@ -638,6 +663,36 @@ def review_alias_cmd(
     typer.echo(f"alias: '{alias}' -> '{into}' [{entity_type}]")
     typer.echo(f"  recorded in {layout.aliases_path}")
     typer.echo("  applied on the next import (restart `synthadoc serve` to pick it up).")
+
+
+@review_app.command("relate")
+def review_relate_cmd(
+    child: str = typer.Argument(..., help="Sub-area name, e.g. 'Doc Intel intent extraction'"),
+    parent: str = typer.Option(..., "--parent", "-p", help="Parent name, e.g. 'Doc Intel'"),
+    entity_type: str = typer.Option(..., "--type", "-t",
+        help="Entity type: project | person | topic | requirement"),
+    wiki: Optional[str] = typer.Option(None, "--wiki", "-w"),
+):
+    """Declare that one entity is a SUB-AREA of another, in kb_relations.yaml.
+
+    Distinct from `alias` (same entity) and `merge` (fold duplicates): this
+    keeps both entities but records a parent/child link. The entity renderer
+    shows a 'Sub-areas' list on the parent and a 'Part of' line on the child.
+    Version-controllable; applied on the next render/import."""
+    from synthadoc.kb import relations as kb_relations
+    root = _resolve_wiki_root(wiki)
+    layout = KBLayout(root)
+    try:
+        kb_relations.add_relation(
+            layout.relations_path, entity_type=entity_type,
+            parent_name=parent, child_name=child,
+        )
+    except kb_relations.RelationError as exc:
+        E.cli_error(E.WIKI_INVALID, str(exc),
+                    "Valid types: project, person, topic, requirement.")
+    typer.echo(f"relate: '{child}' is part of '{parent}' [{entity_type}]")
+    typer.echo(f"  recorded in {layout.relations_path}")
+    typer.echo("  surfaced on the parent/child pages the next time they are rendered (re-import).")
 
 
 @review_app.command("merge")
