@@ -160,32 +160,41 @@ class EntityRenderAgent:
             rel = rel[:-3]
         return f"[[{rel}|{name}]]"
 
-    async def _display_name(self, entity_type: str, slug: str) -> str:
-        """Display name for a (type, slug) — the entity's name if it exists,
-        else a title-cased fall-back from the slug."""
+    async def _linkable(self, entity_type: str, slug: str) -> Optional[str]:
+        """Return the display name if (type, slug) will have a rendered page
+        this import, else None.
+
+        A declared relationship can reference a parent/child that wasn't
+        produced in a given import (the LLM names sub-entities differently
+        run-to-run). Linking to such a slug would dangle, so we only emit a
+        link when the entity exists AND has at least one non-rejected fact
+        (the same condition under which :meth:`render` writes a page). Using
+        the fact count rather than file existence keeps this independent of
+        the order entities are rendered within a run."""
         row = await self._db.get_entity(ids.entity_id(entity_type, slug))
-        if row and row.get("name"):
-            return row["name"]
-        return slug.replace("-", " ")
+        if row is None:
+            return None
+        facts = await self._db.list_facts(entity_id=row["id"])
+        if not any(f.get("review_status") != "rejected" for f in facts):
+            return None
+        return row.get("name") or slug.replace("-", " ")
 
     async def _relationship_links(self, entity: dict) -> tuple[Optional[str], list[str]]:
         """Return (part_of_link, [subarea_links]) for this entity from the
-        declared kb_relations.yaml map."""
+        declared kb_relations.yaml map. Dangling targets are skipped."""
         etype = entity["entity_type"]
         slug = entity["slug"]
         part_of = None
         parent_slug = self._relations.parent_of(etype, slug)
         if parent_slug:
-            part_of = self._entity_link(
-                etype, parent_slug, await self._display_name(etype, parent_slug)
-            )
+            name = await self._linkable(etype, parent_slug)
+            if name is not None:
+                part_of = self._entity_link(etype, parent_slug, name)
         subareas = []
         for child_slug in self._relations.children_of(etype, slug):
-            subareas.append(
-                self._entity_link(
-                    etype, child_slug, await self._display_name(etype, child_slug)
-                )
-            )
+            name = await self._linkable(etype, child_slug)
+            if name is not None:
+                subareas.append(self._entity_link(etype, child_slug, name))
         return part_of, subareas
 
     async def _queue_proposal(

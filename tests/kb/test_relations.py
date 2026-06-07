@@ -134,6 +134,40 @@ async def test_child_page_shows_part_of(wired):
     assert "_Part of [[kb/entities/projects/doc-intel/index|Doc Intel]]_" in body
 
 
+async def test_subarea_link_skipped_when_child_absent(wired):
+    """A declared sub-area whose child entity wasn't produced this import is
+    omitted, so the parent page never carries a dangling link."""
+    layout, db, src = wired
+    await _entity_with_fact(db, layout, slug="doc-intel", name="Doc Intel", src=src)
+    # Declare a child that does NOT exist as an entity this import.
+    relations.add_relation(layout.relations_path, entity_type="project",
+                           parent_name="Doc Intel",
+                           child_name="Doc Intel ghost workstream")
+    agent = EntityRenderAgent(db=db, layout=layout, rules=_RULES)
+    res = await agent.render(ids.entity_id("project", "doc-intel"))
+    body = res.path.read_text(encoding="utf-8")
+    # No Sub-areas section at all, since the only declared child has no page.
+    assert "## Sub-areas" not in body
+    assert "doc-intel-ghost-workstream" not in body
+
+
+async def test_subarea_link_skipped_when_child_has_no_facts(wired):
+    """An entity row with zero facts gets no page, so it isn't linked."""
+    layout, db, src = wired
+    await _entity_with_fact(db, layout, slug="doc-intel", name="Doc Intel", src=src)
+    # Child entity row exists but carries no facts → no page.
+    await db.upsert_entity(
+        id=ids.entity_id("project", "doc-intel-empty"), entity_type="project",
+        name="Doc Intel empty", slug="doc-intel-empty",
+        path="kb/entities/projects/doc-intel-empty/index.md",
+    )
+    relations.add_relation(layout.relations_path, entity_type="project",
+                           parent_name="Doc Intel", child_name="Doc Intel empty")
+    agent = EntityRenderAgent(db=db, layout=layout, rules=_RULES)
+    res = await agent.render(ids.entity_id("project", "doc-intel"))
+    assert "## Sub-areas" not in res.path.read_text(encoding="utf-8")
+
+
 async def test_no_relations_means_no_sections(wired):
     layout, db, src = wired
     await _entity_with_fact(db, layout, slug="doc-intel", name="Doc Intel", src=src)
