@@ -78,13 +78,18 @@ class ConsolidateAgent:
                  search: HybridSearch,
                  wiki_root: Optional[Path] = None,
                  min_chars: int = 2000,
-                 length_floor: float = 0.5) -> None:
+                 length_floor: float = 0.5,
+                 max_tokens: int = 40000) -> None:
         self._provider = provider
         self._store = store
         self._search = search
         self._wiki_root = Path(wiki_root) if wiki_root is not None else None
         self._min_chars = min_chars
         self._length_floor = length_floor
+        # A consolidated page can be nearly as large as the accumulated input,
+        # so the 4096 default would truncate the rewrite (losing provenance
+        # footers → preservation check fails). Give it a real output budget.
+        self._max_tokens = max_tokens
 
     async def consolidate(self, slug: str, force: bool = False,
                           dry_run: bool = False) -> ConsolidateResult:
@@ -131,6 +136,7 @@ class ConsolidateAgent:
             messages=[Message(role="user", content=prompt)],
             system=user_context or None,
             temperature=0.0,
+            max_tokens=self._max_tokens,
         )
 
         new_body = self._strip_code_fences(resp.text.strip())

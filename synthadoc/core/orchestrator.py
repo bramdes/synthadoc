@@ -343,6 +343,7 @@ class Orchestrator:
         result = await ConsolidateAgent(
             provider=_provider, store=self._store, search=self._search,
             wiki_root=self._root,
+            max_tokens=self._cfg.ingest.decision_max_tokens,
         ).consolidate(slug, force=force, dry_run=dry_run)
         _model = self._cfg.agents.resolve("ingest").model
         cost_usd = estimate_cost(
