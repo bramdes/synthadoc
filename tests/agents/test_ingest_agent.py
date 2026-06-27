@@ -6,7 +6,7 @@ import aiosqlite
 from unittest.mock import AsyncMock
 from synthadoc.agents.ingest_agent import IngestAgent, IngestResult, _slugify, _coerce_str_list
 from synthadoc.providers.base import CompletionResponse
-from synthadoc.storage.wiki import WikiStorage
+from synthadoc.storage.wiki import WikiStorage, WikiPage
 from synthadoc.storage.search import HybridSearch
 from synthadoc.storage.log import LogWriter, AuditDB
 from synthadoc.core.cache import CacheManager
@@ -101,6 +101,53 @@ async def test_decision_call_uses_large_max_tokens(tmp_wiki, mock_provider):
     decision_calls = [c for c in mock_provider.complete.call_args_list
                       if c.kwargs.get("max_tokens") == 40000]
     assert decision_calls, "decision step did not pass max_tokens=40000"
+
+
+@pytest.mark.asyncio
+async def test_wiki_alias_folds_variant_slug_into_keeper(tmp_wiki):
+    """A declared alias must canonicalize the LLM's create/link decisions at
+    ingest, so a variant slug appends to the keeper instead of forming a dup."""
+    from synthadoc.storage.wiki_aliases import parse as parse_aliases
+    store = WikiStorage(tmp_wiki / "wiki")
+    search = HybridSearch(store, tmp_wiki / ".synthadoc" / "embeddings.db")
+    log = LogWriter(tmp_wiki / "wiki" / "log.md")
+    audit = AuditDB(tmp_wiki / ".synthadoc" / "audit.db")
+    await audit.init()
+    cache = CacheManager(tmp_wiki / ".synthadoc" / "cache.db")
+    await cache.init()
+
+    # Keeper page already exists.
+    store.write_page("lyzr", WikiPage(title="Lyzr", tags=[], content="# Lyzr\n\nKeeper.",
+                                      status="active", confidence="medium", sources=[]),
+                     folder="projects")
+
+    # Provider: analyse, then a decision that CREATES the variant slug 'liz'
+    # and writes a [[liz]] body link — both must be folded to 'lyzr'.
+    p = AsyncMock()
+    entity = CompletionResponse(text='{"entities":["Lyzr"],"tags":["ai"]}',
+                               input_tokens=10, output_tokens=5)
+    decision = CompletionResponse(
+        text='{"actions":[{"action":"create","new_slug":"liz",'
+             '"page_content":"# Liz\\n\\nNew note linking [[liz]]."}]}',
+        input_tokens=10, output_tokens=5)
+    import itertools
+    p.complete.side_effect = itertools.cycle([entity, decision])
+
+    aliases = parse_aliases("aliases:\n  lyzr:\n    - liz\n")
+    agent = IngestAgent(provider=p, store=store, search=search,
+                        log_writer=log, audit_db=audit, cache=cache, max_pages=15,
+                        wiki_aliases=aliases)
+
+    source = tmp_wiki / "raw_sources" / "v.md"
+    source.write_text("Discussion of Liz/Lyzr platform.", encoding="utf-8")
+    result = await agent.ingest(str(source))
+
+    # No 'liz' page was created; the keeper absorbed it.
+    assert not store.page_exists("liz")
+    assert "lyzr" in result.pages_updated
+    keeper = store.read_page("lyzr")
+    assert "New note linking [[lyzr]]." in keeper.content   # body link canonicalized
+    assert "[[liz]]" not in keeper.content
 
 
 @pytest.mark.asyncio

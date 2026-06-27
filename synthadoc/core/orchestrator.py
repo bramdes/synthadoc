@@ -20,6 +20,7 @@ from synthadoc.providers.pricing import estimate_cost
 from synthadoc.storage.log import AuditDB, LogWriter
 from synthadoc.storage.search import HybridSearch
 from synthadoc.storage.wiki import WikiStorage
+from synthadoc.storage import wiki_aliases as _wiki_aliases
 
 logger = logging.getLogger(__name__)
 
@@ -141,6 +142,7 @@ class Orchestrator:
                 decision_max_tokens=self._cfg.ingest.decision_max_tokens,
                 model=_agent_cfg.model,
                 is_local=(_agent_cfg.provider == "ollama"),
+                wiki_aliases=_wiki_aliases.load(self._root / "wiki_aliases.yaml"),
             )
             # The agent finalizes result.cost_usd before it writes the audit
             # ledger + activity log, so both reflect the real cost (not $0).

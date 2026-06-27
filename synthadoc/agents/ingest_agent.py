@@ -22,6 +22,7 @@ from synthadoc.providers.pricing import estimate_cost
 from synthadoc.storage.log import AuditDB, LogWriter
 from synthadoc.storage.search import HybridSearch
 from synthadoc.storage.wiki import WikiPage, WikiStorage
+from synthadoc.storage.wiki_aliases import WikiAliases
 
 logger = logging.getLogger(__name__)
 
@@ -199,7 +200,8 @@ class IngestAgent:
                  cache_version: str = CACHE_VERSION,
                  fetch_timeout: int = 30,
                  decision_max_tokens: int = 40000,
-                 model: str = "", is_local: bool = False) -> None:
+                 model: str = "", is_local: bool = False,
+                 wiki_aliases: Optional[WikiAliases] = None) -> None:
         self._provider = provider
         self._store = store
         self._search = search
@@ -220,10 +222,24 @@ class IngestAgent:
         # too late for the audit ledger and log.md).
         self._model = model
         self._is_local = is_local
+        # Declared page-slug aliases (wiki_aliases.yaml). Applied to every
+        # LLM-decided slug + body wikilink so a known variant is folded into its
+        # canonical page at ingest — duplicates never re-form, no LLM needed.
+        self._wiki_aliases = wiki_aliases or WikiAliases()
         self._skill_agent = SkillAgent(skill_kwargs={
             "url": {"fetch_timeout": fetch_timeout},
             "youtube": {"provider": self._provider},
         })
+
+    def _canon_links(self, text: str) -> str:
+        """Rewrite ``[[variant]]`` / ``[[variant|alias]]`` wikilinks in body text
+        to their canonical slug per wiki_aliases.yaml. No-op when no aliases."""
+        if not text or self._wiki_aliases.is_empty:
+            return text
+        for variant, canon in self._wiki_aliases.by_slug.items():
+            text = re.sub(r"\[\[" + re.escape(variant) + r"(\]\]|\|)",
+                          f"[[{canon}" + r"\1", text)
+        return text
 
     def _finalize_cost(self, result: IngestResult) -> None:
         """Set result.cost_usd from the accumulated token split.
@@ -581,10 +597,12 @@ class IngestAgent:
         if kind == "skip" or not kind:
             return
 
-        target = act.get("target") or ""
+        # Canonicalize the LLM-decided target slug and any body wikilinks
+        # through wiki_aliases.yaml so declared variants fold into the keeper.
+        target = self._wiki_aliases.canonical(act.get("target") or "")
         new_slug = act.get("new_slug") or ""
-        update_content = (act.get("update_content") or "").strip()
-        page_content = (act.get("page_content") or "").strip()
+        update_content = self._canon_links((act.get("update_content") or "").strip())
+        page_content = self._canon_links((act.get("page_content") or "").strip())
         if update_content:
             update_content = self._stamp_provenance(update_content, source_label, source_date)
         if page_content:
@@ -630,6 +648,9 @@ class IngestAgent:
             if not slug or slug in _SLUG_BLACKLIST or _is_meeting_slug(slug):
                 logger.warning("Skipping create — slug rejected: %r → %r", new_slug, slug)
                 return
+            # Fold a declared variant slug into its canonical page (the
+            # page_exists branch below then appends rather than creating a dup).
+            slug = self._wiki_aliases.canonical(slug)
 
             if self._store.page_exists(slug):
                 # Slug already exists — append page_content as a new section instead of overwriting

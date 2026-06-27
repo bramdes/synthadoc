@@ -118,5 +118,6 @@ from synthadoc.cli import cache  # noqa: F401, E402
 from synthadoc.cli import scaffold  # noqa: F401, E402
 from synthadoc.cli import consolidate  # noqa: F401, E402
 from synthadoc.cli import kb  # noqa: F401, E402  (registers `synthadoc kb` sub-app)
+from synthadoc.cli import wiki  # noqa: F401, E402  (registers `synthadoc wiki` sub-app)
 from synthadoc.cli.audit import audit_app  # noqa: F401, E402
 app.add_typer(audit_app)
