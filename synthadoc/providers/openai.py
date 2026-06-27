@@ -46,6 +46,17 @@ class OpenAIProvider(LLMProvider):
         self._timeout: int | None = timeout if timeout > 0 else None
         base = str(config.base_url or "")
         self.supports_vision = not any(host in base for host in _NO_VISION_HOSTS)
+        # Gemini 3.x is a "thinking" model: via the OpenAI-compat endpoint its
+        # reasoning tokens are billed as completion tokens and count against
+        # max_tokens. On a large structured response (e.g. the ingest decision
+        # step, which emits several full page bodies in one JSON object) the
+        # budget can be exhausted *during thinking*, so the model returns empty
+        # content and the caller sees no actions. Passing a low reasoning_effort
+        # reserves the output budget for the actual answer.
+        self._is_gemini = (
+            config.provider == "gemini"
+            or "generativelanguage.googleapis.com" in base
+        )
 
     @staticmethod
     def _to_openai_content(content):
@@ -66,6 +77,32 @@ class OpenAIProvider(LLMProvider):
         return result
 
     @staticmethod
+    def _extract_trailing_json(text: str) -> str:
+        """Return the last balanced JSON array or object in *text*, or "".
+
+        Reasoning models sometimes emit their final answer as JSON inside
+        ``reasoning_content``. Earlier this only recovered arrays (``[...]``);
+        the ingest decision step returns an object (``{...}``), so we take the
+        last closing bracket and walk back to its *balanced* opener (so a nested
+        ``{"actions": [{...}]}`` returns the whole object, not an inner one).
+        """
+        close = max(text.rfind("]"), text.rfind("}"))
+        if close < 0:
+            return ""
+        closer = text[close]
+        opener = "[" if closer == "]" else "{"
+        depth = 0
+        for i in range(close, -1, -1):
+            ch = text[i]
+            if ch == closer:
+                depth += 1
+            elif ch == opener:
+                depth -= 1
+                if depth == 0:
+                    return text[i: close + 1]
+        return ""
+
+    @staticmethod
     def _is_daily_quota_error(exc: _openai.RateLimitError) -> bool:
         """Return True when this 429 is a per-day (not per-minute) quota exhaustion.
 
@@ -82,13 +119,15 @@ class OpenAIProvider(LLMProvider):
         return "perday" in text or "requests_per_day" in text or "daily quota" in text
 
     async def _call_with_retry(self, msgs: list, temperature: float,
-                               max_tokens: int):
+                               max_tokens: int, extra: Optional[dict] = None):
         """Call the completions API, retrying once on per-minute 429 rate-limit.
 
+        ``extra`` carries optional create() kwargs (e.g. ``reasoning_effort``).
         Daily quota exhaustion raises immediately (no sleep, no retry) — sleeping
         65 s and retrying would waste time and consume another scarce daily request.
         See _RATE_LIMIT_RETRY_DELAYS_S for per-minute retry rationale.
         """
+        extra = extra or {}
         last_exc: Exception | None = None
         for attempt, wait in enumerate([0] + list(_RATE_LIMIT_RETRY_DELAYS_S)):
             if wait:
@@ -104,7 +143,7 @@ class OpenAIProvider(LLMProvider):
                 return await self._client.chat.completions.create(
                     model=self._config.model, messages=msgs,
                     temperature=temperature, max_tokens=max_tokens,
-                    timeout=self._timeout,
+                    timeout=self._timeout, **extra,
                 )
             except _openai.APITimeoutError:
                 logger.error(
@@ -135,7 +174,21 @@ class OpenAIProvider(LLMProvider):
             msgs.append({"role": "system", "content": system})
         msgs.extend({"role": m.role, "content": self._to_openai_content(m.content)}
                     for m in messages)
-        resp = await self._call_with_retry(msgs, temperature, max_tokens)
+        # For Gemini (a thinking model on the OpenAI-compat endpoint) cap the
+        # reasoning effort so thinking tokens don't consume the output budget.
+        extra: dict = {"reasoning_effort": "low"} if self._is_gemini else {}
+        try:
+            resp = await self._call_with_retry(msgs, temperature, max_tokens, extra)
+        except (_openai.BadRequestError, TypeError) as exc:
+            # Some models / SDK versions reject reasoning_effort. Don't fail the
+            # whole call over an optional knob — retry once without it.
+            if not extra:
+                raise
+            logger.warning(
+                "reasoning_effort rejected by %s/%s (%s) — retrying without it.",
+                self._config.provider, self._config.model, type(exc).__name__,
+            )
+            resp = await self._call_with_retry(msgs, temperature, max_tokens, {})
         if not resp.choices:
             # Some providers (e.g. MiniMax) return choices=null when the model
             # exceeds its internal generation budget. Extract any error details.
@@ -162,25 +215,33 @@ class OpenAIProvider(LLMProvider):
         if not text:
             # Reasoning models (e.g. MiniMax M2.x) return content=null and put their
             # answer in a non-standard reasoning_content field.  For structured callers
-            # (e.g. decompose) we extract the last JSON array; for prose callers
-            # (e.g. query synthesis) we fall back to the full cleaned text.
-            extra = getattr(choice.message, "model_extra", None) or {}
-            reasoning = (extra.get("reasoning_content") or "").strip()
+            # (e.g. decompose) we extract the last JSON array OR object; for prose
+            # callers (e.g. query synthesis) we fall back to the full cleaned text.
+            msg_extra = getattr(choice.message, "model_extra", None) or {}
+            reasoning = (msg_extra.get("reasoning_content") or "").strip()
             if reasoning:
                 clean = re.sub(r"<think>.*?</think>", "", reasoning, flags=re.DOTALL).strip()
-                last_close = clean.rfind("]")
-                if last_close >= 0:
-                    last_open = clean.rfind("[", 0, last_close)
-                    if last_open >= 0:
-                        text = clean[last_open: last_close + 1]
-                        logger.debug(
-                            "OpenAI provider: content=null — extracted JSON from reasoning_content"
-                        )
+                text = self._extract_trailing_json(clean) or ""
                 if not text:
                     text = clean
                     logger.debug(
                         "OpenAI provider: content=null — using full reasoning_content as prose answer"
                     )
+                else:
+                    logger.debug(
+                        "OpenAI provider: content=null — extracted JSON from reasoning_content"
+                    )
+        # Surface the most common silent failure: the model ran out of output
+        # budget (often during thinking) and returned nothing. A bare empty
+        # string here means a downstream JSON parse yields {} → no actions.
+        finish = getattr(choice, "finish_reason", None)
+        if not text and finish == "length":
+            logger.warning(
+                "%s/%s returned empty content with finish_reason=length — the "
+                "output budget (max_tokens=%d) was exhausted, likely during "
+                "thinking. Raise max_tokens for this call or lower reasoning_effort.",
+                self._config.provider, self._config.model, max_tokens,
+            )
         return CompletionResponse(text=text,
                                   input_tokens=resp.usage.prompt_tokens,
                                   output_tokens=resp.usage.completion_tokens)

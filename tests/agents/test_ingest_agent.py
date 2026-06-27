@@ -77,6 +77,33 @@ async def test_ingest_creates_page(tmp_wiki, mock_provider):
 
 
 @pytest.mark.asyncio
+async def test_decision_call_uses_large_max_tokens(tmp_wiki, mock_provider):
+    """The decision step must request a large output budget so multi-page JSON
+    isn't truncated (the cause of empty decisions → no pages written)."""
+    store = WikiStorage(tmp_wiki / "wiki")
+    search = HybridSearch(store, tmp_wiki / ".synthadoc" / "embeddings.db")
+    log = LogWriter(tmp_wiki / "wiki" / "log.md")
+    audit = AuditDB(tmp_wiki / ".synthadoc" / "audit.db")
+    await audit.init()
+    cache = CacheManager(tmp_wiki / ".synthadoc" / "cache.db")
+    await cache.init()
+
+    source = tmp_wiki / "raw_sources" / "budget.md"
+    source.write_text("# Topic\nSome content about a project.", encoding="utf-8")
+
+    agent = IngestAgent(provider=mock_provider, store=store, search=search,
+                        log_writer=log, audit_db=audit, cache=cache, max_pages=15,
+                        decision_max_tokens=40000)
+    await agent.ingest(str(source))
+
+    # complete() is called: [analyse, decision]. The decision call must carry the
+    # large max_tokens; the analyse call uses the default.
+    decision_calls = [c for c in mock_provider.complete.call_args_list
+                      if c.kwargs.get("max_tokens") == 40000]
+    assert decision_calls, "decision step did not pass max_tokens=40000"
+
+
+@pytest.mark.asyncio
 async def test_ingest_skips_duplicate(tmp_wiki, mock_provider):
     store = WikiStorage(tmp_wiki / "wiki")
     search = HybridSearch(store, tmp_wiki / ".synthadoc" / "embeddings.db")

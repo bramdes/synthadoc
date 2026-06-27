@@ -841,6 +841,155 @@ def test_classify_llm_error_returns_none_for_unrecognised():
 
 
 @pytest.mark.asyncio
+async def test_gemini_complete_passes_low_reasoning_effort():
+    """Gemini calls must pass reasoning_effort=low so thinking doesn't eat the
+    output budget (the root cause of empty decision responses)."""
+    from synthadoc.providers.openai import OpenAIProvider
+    cfg = AgentConfig(provider="gemini", model="gemini-3.5-flash",
+                      base_url="https://generativelanguage.googleapis.com/v1beta/openai/")
+    provider = OpenAIProvider(api_key="test-key", config=cfg)
+
+    mock_choice = MagicMock()
+    mock_choice.message.content = "ok"
+    mock_choice.message.model_extra = {}
+    mock_choice.finish_reason = "stop"
+    mock_resp = MagicMock()
+    mock_resp.choices = [mock_choice]
+    mock_resp.usage.prompt_tokens = 5
+    mock_resp.usage.completion_tokens = 2
+
+    mock_create = AsyncMock(return_value=mock_resp)
+    with patch.object(provider._client.chat.completions, "create", new=mock_create):
+        await provider.complete(messages=[Message(role="user", content="hi")])
+    _, kwargs = mock_create.call_args
+    assert kwargs.get("reasoning_effort") == "low"
+
+
+@pytest.mark.asyncio
+async def test_non_gemini_complete_omits_reasoning_effort():
+    """Providers that aren't Gemini must not receive reasoning_effort (some reject it)."""
+    from synthadoc.providers.openai import OpenAIProvider
+    cfg = AgentConfig(provider="groq", model="llama-3.3-70b-versatile",
+                      base_url="https://api.groq.com/openai/v1")
+    provider = OpenAIProvider(api_key="test-key", config=cfg)
+
+    mock_choice = MagicMock()
+    mock_choice.message.content = "ok"
+    mock_choice.message.model_extra = {}
+    mock_choice.finish_reason = "stop"
+    mock_resp = MagicMock()
+    mock_resp.choices = [mock_choice]
+    mock_resp.usage.prompt_tokens = 5
+    mock_resp.usage.completion_tokens = 2
+
+    mock_create = AsyncMock(return_value=mock_resp)
+    with patch.object(provider._client.chat.completions, "create", new=mock_create):
+        await provider.complete(messages=[Message(role="user", content="hi")])
+    _, kwargs = mock_create.call_args
+    assert "reasoning_effort" not in kwargs
+
+
+@pytest.mark.asyncio
+async def test_gemini_reasoning_effort_rejected_falls_back():
+    """If reasoning_effort is rejected (BadRequest), retry once without it rather
+    than failing the whole call."""
+    import openai
+    from synthadoc.providers.openai import OpenAIProvider
+    cfg = AgentConfig(provider="gemini", model="gemini-3.5-flash",
+                      base_url="https://generativelanguage.googleapis.com/v1beta/openai/")
+    provider = OpenAIProvider(api_key="test-key", config=cfg)
+
+    ok_choice = MagicMock()
+    ok_choice.message.content = "recovered"
+    ok_choice.message.model_extra = {}
+    ok_choice.finish_reason = "stop"
+    ok_resp = MagicMock()
+    ok_resp.choices = [ok_choice]
+    ok_resp.usage.prompt_tokens = 5
+    ok_resp.usage.completion_tokens = 2
+
+    calls = []
+
+    async def create(*args, **kwargs):
+        calls.append(kwargs)
+        if "reasoning_effort" in kwargs:
+            raise openai.BadRequestError(
+                message="unknown parameter reasoning_effort",
+                response=MagicMock(status_code=400), body={})
+        return ok_resp
+
+    with patch.object(provider._client.chat.completions, "create", side_effect=create):
+        result = await provider.complete(messages=[Message(role="user", content="hi")])
+
+    assert result.text == "recovered"
+    assert len(calls) == 2
+    assert "reasoning_effort" in calls[0]
+    assert "reasoning_effort" not in calls[1]
+
+
+@pytest.mark.asyncio
+async def test_gemini_extracts_json_object_from_reasoning_content():
+    """The decision step returns a JSON OBJECT; content=null fallback must recover
+    {...}, not only [...]."""
+    from synthadoc.providers.openai import OpenAIProvider
+    cfg = AgentConfig(provider="gemini", model="gemini-3.5-flash",
+                      base_url="https://generativelanguage.googleapis.com/v1beta/openai/")
+    provider = OpenAIProvider(api_key="test-key", config=cfg)
+
+    mock_choice = MagicMock()
+    mock_choice.message.content = None
+    mock_choice.message.model_extra = {
+        "reasoning_content": 'Here is my decision: {"actions": [{"action": "update"}]}'
+    }
+    mock_choice.finish_reason = "stop"
+    mock_resp = MagicMock()
+    mock_resp.choices = [mock_choice]
+    mock_resp.usage.prompt_tokens = 10
+    mock_resp.usage.completion_tokens = 0
+
+    with patch.object(provider._client.chat.completions, "create",
+                      new=AsyncMock(return_value=mock_resp)):
+        result = await provider.complete(messages=[Message(role="user", content="decide")])
+    assert result.text == '{"actions": [{"action": "update"}]}'
+
+
+def test_extract_trailing_json_handles_object_and_array():
+    from synthadoc.providers.openai import OpenAIProvider
+    assert OpenAIProvider._extract_trailing_json('prose {"a": 1}') == '{"a": 1}'
+    assert OpenAIProvider._extract_trailing_json('prose ["a", "b"]') == '["a", "b"]'
+    # whichever closes last wins
+    assert OpenAIProvider._extract_trailing_json('["x"] then {"y": 2}') == '{"y": 2}'
+    assert OpenAIProvider._extract_trailing_json("no json here") == ""
+
+
+@pytest.mark.asyncio
+async def test_gemini_empty_on_length_logs_warning(caplog):
+    """Empty content + finish_reason=length must emit a diagnostic warning rather
+    than silently returning ''."""
+    import logging
+    from synthadoc.providers.openai import OpenAIProvider
+    cfg = AgentConfig(provider="gemini", model="gemini-3.5-flash",
+                      base_url="https://generativelanguage.googleapis.com/v1beta/openai/")
+    provider = OpenAIProvider(api_key="test-key", config=cfg)
+
+    mock_choice = MagicMock()
+    mock_choice.message.content = None
+    mock_choice.message.model_extra = {}
+    mock_choice.finish_reason = "length"
+    mock_resp = MagicMock()
+    mock_resp.choices = [mock_choice]
+    mock_resp.usage.prompt_tokens = 5000
+    mock_resp.usage.completion_tokens = 4096
+
+    with patch.object(provider._client.chat.completions, "create",
+                      new=AsyncMock(return_value=mock_resp)):
+        with caplog.at_level(logging.WARNING, logger="synthadoc.providers.openai"):
+            result = await provider.complete(messages=[Message(role="user", content="hi")])
+    assert result.text == ""
+    assert any("finish_reason=length" in r.message for r in caplog.records)
+
+
+@pytest.mark.asyncio
 async def test_ollama_provider_uses_eval_count_for_output_tokens():
     """OllamaProvider must read eval_count from the response for output_tokens."""
     from synthadoc.providers.ollama import OllamaProvider

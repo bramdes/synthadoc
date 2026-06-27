@@ -92,6 +92,11 @@ class IngestConfig:
     # LLM response that exceeds this raises FactExtractBudgetExceeded inside
     # the kb pipeline; the page-tier ingest is unaffected.
     max_tokens_per_fact_extract: int = 0
+    # Output budget for the page-tier decision step. It emits several full page
+    # bodies in one JSON object, so the 4096 default truncates it (and on
+    # thinking models the budget is shared with reasoning). Too small → empty
+    # decisions → pages never get written.
+    decision_max_tokens: int = 40000
 
 
 @dataclass
@@ -293,6 +298,7 @@ def _raw_to_config(raw: dict, source_has_agents: bool) -> Config:
         chunk_overlap=ig.get("chunk_overlap", 150),
         fetch_timeout_seconds=ig.get("fetch_timeout_seconds", 30),
         max_tokens_per_fact_extract=int(ig.get("max_tokens_per_fact_extract", 0)),
+        decision_max_tokens=int(ig.get("decision_max_tokens", 40000)),
     )
 
     # --- query ---

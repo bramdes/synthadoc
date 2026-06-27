@@ -196,7 +196,8 @@ class IngestAgent:
                  log_writer: LogWriter, audit_db: AuditDB, cache: CacheManager,
                  max_pages: int = 15, wiki_root: Optional[Path] = None,
                  cache_version: str = CACHE_VERSION,
-                 fetch_timeout: int = 30) -> None:
+                 fetch_timeout: int = 30,
+                 decision_max_tokens: int = 40000) -> None:
         self._provider = provider
         self._store = store
         self._search = search
@@ -206,6 +207,11 @@ class IngestAgent:
         self._max_pages = max_pages
         self._wiki_root = Path(wiki_root) if wiki_root is not None else None
         self._cache_version = cache_version
+        # The decision step emits several full page bodies in one JSON object, so
+        # it needs a far larger output budget than the 4096 default — especially
+        # on thinking models where reasoning shares that budget. Too small a cap
+        # truncates the JSON (or empties it during thinking) → zero page actions.
+        self._decision_max_tokens = decision_max_tokens
         self._skill_agent = SkillAgent(skill_kwargs={
             "url": {"fetch_timeout": fetch_timeout},
             "youtube": {"provider": self._provider},
@@ -491,6 +497,7 @@ class IngestAgent:
                 ))],
                 system=user_context or None,
                 temperature=0.0,
+                max_tokens=self._decision_max_tokens,
             )
             result.tokens_used += resp2.total_tokens
             result.input_tokens += resp2.input_tokens
