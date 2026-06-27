@@ -83,3 +83,34 @@ async def test_list_queries_respects_limit(tmp_wiki):
                                tokens=50, cost_usd=0.0001)
     records = await db.list_queries(limit=3)
     assert len(records) == 3
+
+
+@pytest.mark.asyncio
+async def test_find_by_path_returns_latest(tmp_wiki):
+    """find_by_path() returns the most recent ingest row for a staging path."""
+    db = AuditDB(tmp_wiki / ".synthadoc" / "audit.db")
+    await db.init()
+    await db.record_ingest(source_hash="old", source_size=10, source_path="m.md",
+                           wiki_page="m", tokens=1, cost_usd=0.0)
+    await db.record_ingest(source_hash="new", source_size=20, source_path="m.md",
+                           wiki_page="m", tokens=1, cost_usd=0.0)
+    row = await db.find_by_path("m.md")
+    assert row is not None and row["source_hash"] == "new"
+    assert await db.find_by_path("absent.md") is None
+
+
+@pytest.mark.asyncio
+async def test_delete_ingests_by_hash(tmp_wiki):
+    """delete_ingests_by_hash() forgets a source from the dedup ledger."""
+    db = AuditDB(tmp_wiki / ".synthadoc" / "audit.db")
+    await db.init()
+    await db.record_ingest(source_hash="h1", source_size=10, source_path="a.md",
+                           wiki_page="a", tokens=1, cost_usd=0.0)
+    await db.record_ingest(source_hash="h2", source_size=10, source_path="b.md",
+                           wiki_page="b", tokens=1, cost_usd=0.0)
+    n = await db.delete_ingests_by_hash("h1")
+    assert n == 1
+    assert await db.find_by_hash("h1", 10) is None
+    assert await db.find_by_hash("h2", 10) is not None
+    # Deleting an absent hash is a harmless no-op.
+    assert await db.delete_ingests_by_hash("nope") == 0

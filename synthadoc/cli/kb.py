@@ -432,6 +432,127 @@ def relink_cmd(
 
 
 # ---------------------------------------------------------------------------
+# kb revert-source — remove one source + its fact-tier artifacts, forget dedup
+# ---------------------------------------------------------------------------
+
+
+@kb_app.command("revert-source")
+def revert_source_cmd(
+    source_id: Optional[str] = typer.Option(
+        None, "--source-id", help="Exact kb source id (e.g. source.document.2026-05-12.standup)"),
+    source_hash: Optional[str] = typer.Option(
+        None, "--source-hash", help="SHA-256 of the previously ingested bytes (precise; used by the feeder)"),
+    path: Optional[str] = typer.Option(
+        None, "--path", help="Staging/source file path; the source is matched by its filename stem"),
+    dry_run: bool = typer.Option(False, "--dry-run", help="Show what would be removed; change nothing"),
+    wiki: Optional[str] = typer.Option(None, "--wiki", "-w"),
+):
+    """Remove a single source and everything the fact tier derived from it,
+    then forget it from the dedup ledger so a re-ingest is not skipped.
+
+    Pass exactly one of --source-id / --source-hash / --path to identify the
+    source. Re-resolves and re-renders affected entities (no LLM). The page
+    tier (wiki/) is append-merged across sources and is left to
+    `synthadoc consolidate`; this command is the fact tier (kb/) + dedup.
+    """
+    from synthadoc.kb import rules as kb_rules
+    from synthadoc.kb.delete_source import delete_source as _delete_source_impl
+    from synthadoc.storage.log import AuditDB
+
+    given = [v for v in (source_id, source_hash, path) if v]
+    if len(given) != 1:
+        E.cli_error(
+            E.INGEST_NOT_FOUND,
+            "Pass exactly one of --source-id, --source-hash, or --path.",
+            "e.g. synthadoc kb revert-source --source-hash <sha256> -w mywiki",
+        )
+
+    root = _resolve_wiki_root(wiki)
+    layout = KBLayout(root)
+    if not layout.db_path.exists():
+        E.cli_error(E.WIKI_INVALID, "kb.db not found.", "Run `synthadoc kb init` first.")
+    audit_path = root / ".synthadoc" / "audit.db"
+
+    async def _run() -> dict:
+        db = KBDB(layout.db_path)
+        await db.init()
+        rules = kb_rules.load(layout.config_path)
+
+        # Resolve the source row from whichever selector was given.
+        src = None
+        if source_id:
+            src = await db.get_source(source_id)
+        elif source_hash:
+            src = await db.find_source_by_sha256(source_hash)
+        else:  # path → match on title (== filename stem at import time)
+            stem = Path(path).stem
+            matches = await db.fetchall(
+                "SELECT * FROM sources WHERE title = ? ORDER BY ingested_at", (stem,)
+            )
+            if len(matches) > 1:
+                ids_str = ", ".join(m["id"] for m in matches)
+                raise RuntimeError(
+                    f"{len(matches)} sources share the title {stem!r}: {ids_str}. "
+                    f"Re-run with --source-id to disambiguate."
+                )
+            src = matches[0] if matches else None
+
+        out: dict = {"resolved_id": src["id"] if src else None,
+                     "sha256": (src.get("sha256") if src else source_hash),
+                     "kb": None, "audit_deleted": 0, "dry_run": dry_run}
+
+        if dry_run:
+            if src:
+                facts = await db.fetchall(
+                    "SELECT COUNT(*) AS n FROM facts WHERE source_id=?", (src["id"],))
+                out["would_delete_facts"] = facts[0]["n"] if facts else 0
+            return out
+
+        if src is not None:
+            res = await _delete_source_impl(db, layout, rules, src["id"])
+            out["kb"] = res
+
+        # Forget from the dedup ledger so the re-ingest runs.
+        sha = out["sha256"]
+        if sha:
+            audit = AuditDB(audit_path)
+            await audit.init()
+            out["audit_deleted"] = await audit.delete_ingests_by_hash(sha)
+        return out
+
+    out = asyncio.run(_run())
+
+    if out["resolved_id"] is None and not out["sha256"]:
+        E.cli_error(
+            E.INGEST_NOT_FOUND,
+            "No matching source found.",
+            "Check the id/hash/path, or list sources via the audit/kb tables.",
+        )
+
+    if out["dry_run"]:
+        typer.echo(f"[DRY RUN] would revert: {out['resolved_id'] or '(no kb source)'}")
+        if "would_delete_facts" in out:
+            typer.echo(f"          facts to delete: {out['would_delete_facts']}")
+        typer.echo(f"          would clear dedup rows for sha256={out['sha256']}")
+        return
+
+    typer.echo(f"Reverted source: {out['resolved_id'] or '(no kb source row)'}")
+    res = out["kb"]
+    if res is not None:
+        typer.echo(f"  facts            {res.facts_deleted}")
+        typer.echo(f"  decisions        {res.decisions_deleted}")
+        typer.echo(f"  summaries        {res.summaries_deleted}")
+        typer.echo(f"  conclusions      {res.conclusions_deleted}")
+        typer.echo(f"  unknowns reopened {res.unknowns_reopened}")
+        typer.echo(f"  entities re-rendered {res.entities_rerendered}")
+        typer.echo(f"  entities deleted {res.entities_deleted}")
+        typer.echo(f"  files deleted    {res.files_deleted}")
+        for w in res.warnings:
+            typer.echo(f"  ! {w}", err=True)
+    typer.echo(f"  dedup rows cleared {out['audit_deleted']}")
+
+
+# ---------------------------------------------------------------------------
 # kb maintenance
 # ---------------------------------------------------------------------------
 

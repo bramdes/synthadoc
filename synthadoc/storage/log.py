@@ -119,6 +119,35 @@ class AuditDB:
             d.setdefault("size", d.get("source_size"))
             return d
 
+    async def find_by_path(self, source_path: str) -> Optional[dict]:
+        """Return the most recent ingest record for *source_path*, or None.
+
+        Used by the feeder to detect a *changed* source: a row exists for the
+        stable staging path but its ``source_hash`` differs from the file's
+        current hash. Newest row wins (``id DESC``) so re-ingests are handled.
+        """
+        async with aiosqlite.connect(self._path) as db:
+            db.row_factory = aiosqlite.Row
+            async with db.execute(
+                "SELECT * FROM ingests WHERE source_path=? ORDER BY id DESC LIMIT 1",
+                (source_path,),
+            ) as cur:
+                row = await cur.fetchone()
+            return dict(row) if row else None
+
+    async def delete_ingests_by_hash(self, source_hash: str) -> int:
+        """Delete every ingest row with *source_hash*; return rows removed.
+
+        Forgets a source from the dedup ledger so a re-ingest is not skipped.
+        Paired with fact-tier ``delete_source`` for a clean per-source revert.
+        """
+        async with aiosqlite.connect(self._path) as db:
+            cur = await db.execute(
+                "DELETE FROM ingests WHERE source_hash=?", (source_hash,)
+            )
+            await db.commit()
+            return cur.rowcount
+
     async def find_by_hash(self, source_hash: str, source_size: int) -> Optional[dict]:
         async with aiosqlite.connect(self._path) as db:
             db.row_factory = aiosqlite.Row
