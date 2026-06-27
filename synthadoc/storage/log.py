@@ -85,6 +85,20 @@ class AuditDB:
                     cost_usd REAL,
                     queried_at TEXT NOT NULL
                 )""")
+            # Fact-tier (kb_pipeline) cost is tracked separately from page-tier
+            # ingests so it does not interfere with the ingest dedup ledger
+            # (find_by_hash / source_path lookups). cost_summary unions it in.
+            await db.execute("""
+                CREATE TABLE IF NOT EXISTS kb_pipeline_costs (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    source_id TEXT NOT NULL,
+                    input_tokens INTEGER,
+                    output_tokens INTEGER,
+                    tokens INTEGER,
+                    cost_usd REAL,
+                    model TEXT,
+                    run_at TEXT NOT NULL
+                )""")
             await db.commit()
 
     async def record_ingest(self, source_hash: str, source_size: int,
@@ -118,6 +132,27 @@ class AuditDB:
             # Expose "size" alias so callers can do existing["size"]
             d.setdefault("size", d.get("source_size"))
             return d
+
+    async def record_kb_pipeline_cost(
+        self, source_id: str, input_tokens: int, output_tokens: int,
+        cost_usd: float, model: str = "",
+    ) -> None:
+        """Record the fact-tier (kb_pipeline) token/cost for one source.
+
+        Kept out of the ``ingests`` table so it never affects the page-tier
+        dedup lookups, but counted by :meth:`cost_summary` so ``synthadoc
+        audit cost`` reflects fact extraction too.
+        """
+        ts = datetime.now(timezone.utc).isoformat()
+        async with aiosqlite.connect(self._path) as db:
+            await db.execute(
+                "INSERT INTO kb_pipeline_costs "
+                "(source_id,input_tokens,output_tokens,tokens,cost_usd,model,run_at) "
+                "VALUES (?,?,?,?,?,?,?)",
+                (source_id, input_tokens, output_tokens,
+                 (input_tokens or 0) + (output_tokens or 0), cost_usd, model, ts),
+            )
+            await db.commit()
 
     async def find_by_path(self, source_path: str) -> Optional[dict]:
         """Return the most recent ingest record for *source_path*, or None.
@@ -214,8 +249,11 @@ class AuditDB:
                     UNION ALL
                     SELECT DATE(queried_at) as day, tokens as day_tokens, cost_usd as day_cost
                     FROM queries WHERE queried_at >= ?
+                    UNION ALL
+                    SELECT DATE(run_at) as day, tokens as day_tokens, cost_usd as day_cost
+                    FROM kb_pipeline_costs WHERE run_at >= ?
                 ) GROUP BY day ORDER BY day DESC
-            """, (cutoff, cutoff)) as cur:
+            """, (cutoff, cutoff, cutoff)) as cur:
                 rows = await cur.fetchall()
 
         total_tokens = 0

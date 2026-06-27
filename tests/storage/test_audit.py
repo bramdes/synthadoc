@@ -114,3 +114,20 @@ async def test_delete_ingests_by_hash(tmp_wiki):
     assert await db.find_by_hash("h2", 10) is not None
     # Deleting an absent hash is a harmless no-op.
     assert await db.delete_ingests_by_hash("nope") == 0
+
+
+@pytest.mark.asyncio
+async def test_kb_pipeline_cost_recorded_and_in_cost_summary(tmp_wiki):
+    """record_kb_pipeline_cost() persists fact-tier cost and cost_summary counts it."""
+    db = AuditDB(tmp_wiki / ".synthadoc" / "audit.db")
+    await db.init()
+    await db.record_ingest(source_hash="h", source_size=10, source_path="m.md",
+                           wiki_page="m", tokens=100, cost_usd=0.01)
+    await db.record_kb_pipeline_cost(
+        source_id="source.document.2026-06-27.x",
+        input_tokens=5000, output_tokens=1000, cost_usd=0.02, model="gemini-3.5-flash",
+    )
+    summary = await db.cost_summary(days=30)
+    # 100 ingest tokens + 6000 kb tokens; 0.01 + 0.02 cost
+    assert summary["total_tokens"] == 100 + 6000
+    assert abs(summary["total_cost_usd"] - 0.03) < 1e-9

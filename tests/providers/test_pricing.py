@@ -62,3 +62,15 @@ def test_minimax_highspeed_same_rates_as_standard():
            estimate_cost("MiniMax-M2.5", 1_000_000, 1_000_000)
     assert estimate_cost("MiniMax-M2.7-highspeed", 1_000_000, 1_000_000) == \
            estimate_cost("MiniMax-M2.7", 1_000_000, 1_000_000)
+
+
+def test_gemini_35_flash_rates():
+    """gemini-3.5-flash: $1.50/M input, $9.00/M output (incl. thinking)."""
+    cost = estimate_cost("gemini-3.5-flash", input_tokens=1_000_000, output_tokens=1_000_000)
+    assert abs(cost - 10.50) < 0.001  # $1.50 + $9.00
+
+
+def test_gemini_31_pro_preview_rates():
+    """gemini-3.1-pro-preview: $2.00/M input, $12.00/M output (<=200K tier)."""
+    cost = estimate_cost("gemini-3.1-pro-preview", input_tokens=1_000_000, output_tokens=1_000_000)
+    assert abs(cost - 14.00) < 0.001  # $2.00 + $12.00

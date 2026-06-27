@@ -53,10 +53,22 @@ class PipelineResult:
     entities_rendered: int = 0
     entities_queued_for_review: int = 0
     errors: list[str] = field(default_factory=list)
+    # Token usage, split by model role so the caller can price each bucket
+    # against the right model (summary vs facts can run on different models).
+    # Cache hits contribute zero — no new LLM call was made.
+    summary_input_tokens: int = 0
+    summary_output_tokens: int = 0
+    extract_input_tokens: int = 0      # facts + decisions + unknowns
+    extract_output_tokens: int = 0
 
     @property
     def ok(self) -> bool:
         return not self.errors
+
+    @property
+    def total_tokens(self) -> int:
+        return (self.summary_input_tokens + self.summary_output_tokens
+                + self.extract_input_tokens + self.extract_output_tokens)
 
 
 async def run_pipeline(
@@ -101,6 +113,9 @@ async def run_pipeline(
     try:
         summary = await summary_agent.summarise(source_id, force=force)
         result.summary_written = not summary.cached
+        if not summary.cached:
+            result.summary_input_tokens += summary.summary.input_tokens
+            result.summary_output_tokens += summary.summary.output_tokens
     except Exception as exc:
         logger.warning("kb pipeline: summary failed for %s: %s", source_id, exc)
         result.errors.append(f"summary: {type(exc).__name__}: {exc}")
@@ -111,6 +126,8 @@ async def run_pipeline(
         extract = await fact_agent.extract(source_id, force=force)
         result.facts_persisted = len(extract.persisted)
         result.facts_rejected = len(extract.rejected)
+        result.extract_input_tokens += extract.input_tokens
+        result.extract_output_tokens += extract.output_tokens
         for p in extract.persisted:
             touched_entities.add(p.entity_id)
     except Exception as exc:
@@ -122,6 +139,8 @@ async def run_pipeline(
         decisions = await decision_agent.extract(source_id, force=force)
         result.decisions_persisted = len(decisions.persisted)
         result.decisions_rejected = len(decisions.rejected)
+        result.extract_input_tokens += decisions.input_tokens
+        result.extract_output_tokens += decisions.output_tokens
         for d in decisions.persisted:
             if d.entity_id:
                 touched_entities.add(d.entity_id)
@@ -134,6 +153,8 @@ async def run_pipeline(
         unknowns = await unknown_agent.extract(source_id, force=force)
         result.unknowns_persisted = len(unknowns.persisted)
         result.unknowns_rejected = len(unknowns.rejected)
+        result.extract_input_tokens += unknowns.input_tokens
+        result.extract_output_tokens += unknowns.output_tokens
         for u in unknowns.persisted:
             if u.entity_id:
                 touched_entities.add(u.entity_id)

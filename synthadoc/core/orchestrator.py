@@ -437,6 +437,32 @@ class Orchestrator:
                 facts_provider=facts_provider,
                 max_tokens_per_fact_extract=self._cfg.ingest.max_tokens_per_fact_extract,
             )
+            # Price each token bucket against the model that produced it
+            # (summary and facts roles can resolve to different models), then
+            # record the fact-tier cost so `audit cost` sees it. Best-effort.
+            try:
+                _sum_cfg = self._cfg.agents.resolve("summary")
+                _fct_cfg = self._cfg.agents.resolve("facts")
+                kb_cost = (
+                    estimate_cost(_sum_cfg.model,
+                                  result.summary_input_tokens,
+                                  result.summary_output_tokens,
+                                  is_local=(_sum_cfg.provider == "ollama"))
+                    + estimate_cost(_fct_cfg.model,
+                                    result.extract_input_tokens,
+                                    result.extract_output_tokens,
+                                    is_local=(_fct_cfg.provider == "ollama"))
+                )
+                await self._audit.record_kb_pipeline_cost(
+                    source_id=source_id,
+                    input_tokens=result.summary_input_tokens + result.extract_input_tokens,
+                    output_tokens=result.summary_output_tokens + result.extract_output_tokens,
+                    cost_usd=kb_cost,
+                    model=_fct_cfg.model,
+                )
+            except Exception as cost_exc:
+                logger.warning("kb pipeline cost not recorded for %s: %s",
+                               source_id, cost_exc)
             await self._queue.complete(job_id, result={
                 "source_id": source_id,
                 "summary_written": result.summary_written,
@@ -444,6 +470,7 @@ class Orchestrator:
                 "facts_rejected": result.facts_rejected,
                 "entities_rendered": result.entities_rendered,
                 "entities_queued_for_review": result.entities_queued_for_review,
+                "tokens_used": result.total_tokens,
                 "errors": result.errors,
                 "ok": result.ok,
             })

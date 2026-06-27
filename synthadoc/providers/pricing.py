@@ -24,6 +24,12 @@ _PRICING: dict[str, tuple[float, float]] = {
     "gpt-4o":                                (2.50e-6, 10.00e-6),
     "gpt-4o-mini":                           (0.15e-6,  0.60e-6),
     # Gemini (via OpenAI-compatible endpoint)
+    # Gemini 3.x rates have cached-input and >200K-prompt tiers the flat
+    # (input, output) table can't express; we record the *standard* rate
+    # (and, for Pro, the up-to-200K tier — the common case). Cached/large-
+    # prompt tiers noted in comments for reference.
+    "gemini-3.5-flash":                      (1.50e-6,  9.00e-6),  # output incl. thinking; cached input $0.15/M
+    "gemini-3.1-pro-preview":                (2.00e-6, 12.00e-6),  # <=200K prompt; >200K: in $4.00/M, out $18.00/M; cached $0.20/$0.40
     "gemini-2.5-flash-lite":                 (0.075e-6, 0.30e-6),  # default; free: 30 RPM / 1,000 RPD
     "gemini-2.5-flash":                      (0.30e-6,  2.50e-6),  # free: 10 RPM / 250 RPD
     "gemini-1.5-flash":                      (0.075e-6, 0.30e-6),  # free: 15 RPM / 1,500 RPD
