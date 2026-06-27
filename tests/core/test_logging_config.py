@@ -111,3 +111,14 @@ def test_rotation_settings_applied(tmp_path):
     assert fh.maxBytes == 2 * 1024 * 1024
     assert fh.backupCount == 7
     _reset_root_logger()
+
+
+def test_noisy_loggers_suppressed_to_warning(tmp_path):
+    """aiosqlite (and other chatty libs) are pinned to WARNING so DEBUG
+    cursor/connection spam never reaches the always-DEBUG file handler."""
+    _reset_root_logger()
+    from synthadoc.core.logging_config import setup_logging
+    setup_logging(tmp_path, cfg=_cfg())
+    for name in ("aiosqlite", "httpx", "httpcore", "uvicorn.access"):
+        assert logging.getLogger(name).level == logging.WARNING, name
+    _reset_root_logger()

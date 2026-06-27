@@ -158,7 +158,10 @@ def setup_logging(
     root.addHandler(file_handler)
 
     # --- Suppress noisy third-party loggers ---
-    for noisy in ("httpx", "httpcore", "uvicorn.access", "anthropic", "openai"):
+    # aiosqlite logs every cursor open/execute/close at DEBUG; since the file
+    # handler captures all DEBUG, it drowns the log. WARNING keeps real errors.
+    for noisy in ("httpx", "httpcore", "uvicorn.access", "anthropic", "openai",
+                  "aiosqlite"):
         logging.getLogger(noisy).setLevel(logging.WARNING)
 
     logging.getLogger(__name__).info(
