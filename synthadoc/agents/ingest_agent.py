@@ -18,6 +18,7 @@ from synthadoc.agents.search_decompose_agent import SearchDecomposeAgent
 from synthadoc.agents.skill_agent import SkillAgent
 from synthadoc.core.cache import CACHE_VERSION, CacheManager, make_cache_key
 from synthadoc.providers.base import LLMProvider, Message
+from synthadoc.providers.pricing import estimate_cost
 from synthadoc.storage.log import AuditDB, LogWriter
 from synthadoc.storage.search import HybridSearch
 from synthadoc.storage.wiki import WikiPage, WikiStorage
@@ -197,7 +198,8 @@ class IngestAgent:
                  max_pages: int = 15, wiki_root: Optional[Path] = None,
                  cache_version: str = CACHE_VERSION,
                  fetch_timeout: int = 30,
-                 decision_max_tokens: int = 40000) -> None:
+                 decision_max_tokens: int = 40000,
+                 model: str = "", is_local: bool = False) -> None:
         self._provider = provider
         self._store = store
         self._search = search
@@ -212,10 +214,29 @@ class IngestAgent:
         # on thinking models where reasoning shares that budget. Too small a cap
         # truncates the JSON (or empties it during thinking) → zero page actions.
         self._decision_max_tokens = decision_max_tokens
+        # Pricing inputs so the agent can finalize result.cost_usd BEFORE it
+        # writes the audit row + activity log. Without this the cost is recorded
+        # as $0 (the orchestrator used to compute it only after ingest() returned,
+        # too late for the audit ledger and log.md).
+        self._model = model
+        self._is_local = is_local
         self._skill_agent = SkillAgent(skill_kwargs={
             "url": {"fetch_timeout": fetch_timeout},
             "youtube": {"provider": self._provider},
         })
+
+    def _finalize_cost(self, result: IngestResult) -> None:
+        """Set result.cost_usd from the accumulated token split.
+
+        Called just before log_ingest / record_ingest so both the activity log
+        and the audit ledger store the real cost. No-op when model is unset
+        (e.g. unit tests that construct the agent without pricing info).
+        """
+        if self._model:
+            result.cost_usd = estimate_cost(
+                self._model, result.input_tokens, result.output_tokens,
+                is_local=self._is_local,
+            )
 
     async def _analyse(self, text: str, bust_cache: bool = False,
                        user_context: str = "") -> dict:
@@ -418,6 +439,7 @@ class IngestAgent:
             else:
                 result.skipped = True
                 result.skip_reason = result.skip_reason or "has_summary source had no usable slug"
+            self._finalize_cost(result)
             self._log.log_ingest(source=p.name,
                                  pages_created=result.pages_created,
                                  pages_updated=result.pages_updated,
@@ -536,6 +558,7 @@ class IngestAgent:
         if result.pages_created or result.pages_updated:
             await self._update_overview()
 
+        self._finalize_cost(result)
         self._log.log_ingest(source=p.name,
                              pages_created=result.pages_created,
                              pages_updated=result.pages_updated,

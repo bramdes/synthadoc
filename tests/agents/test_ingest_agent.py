@@ -104,6 +104,34 @@ async def test_decision_call_uses_large_max_tokens(tmp_wiki, mock_provider):
 
 
 @pytest.mark.asyncio
+async def test_audit_records_real_cost(tmp_wiki, mock_provider):
+    """The agent must finalize cost BEFORE writing the audit row, so the ledger
+    stores the real cost (regression: it used to always record $0)."""
+    store = WikiStorage(tmp_wiki / "wiki")
+    search = HybridSearch(store, tmp_wiki / ".synthadoc" / "embeddings.db")
+    log = LogWriter(tmp_wiki / "wiki" / "log.md")
+    audit = AuditDB(tmp_wiki / ".synthadoc" / "audit.db")
+    await audit.init()
+    cache = CacheManager(tmp_wiki / ".synthadoc" / "cache.db")
+    await cache.init()
+
+    source = tmp_wiki / "raw_sources" / "cost.md"
+    source.write_text("# Topic\nContent worth a page.", encoding="utf-8")
+
+    agent = IngestAgent(provider=mock_provider, store=store, search=search,
+                        log_writer=log, audit_db=audit, cache=cache, max_pages=15,
+                        model="gemini-3.5-flash", is_local=False)
+    result = await agent.ingest(str(source))
+    assert result.cost_usd > 0
+
+    import hashlib
+    digest = hashlib.sha256(source.read_bytes()).hexdigest()
+    row = await audit.find_by_hash_only(digest)
+    assert row is not None
+    assert row["cost_usd"] > 0, "audit ledger recorded $0 instead of the real cost"
+
+
+@pytest.mark.asyncio
 async def test_ingest_skips_duplicate(tmp_wiki, mock_provider):
     store = WikiStorage(tmp_wiki / "wiki")
     search = HybridSearch(store, tmp_wiki / ".synthadoc" / "embeddings.db")

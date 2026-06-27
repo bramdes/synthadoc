@@ -130,6 +130,7 @@ class Orchestrator:
             _is_web_search = bool(_WEB_SEARCH_RE.match(source))
             if _is_web_search:
                 await self._queue.update_progress(job_id, {"phase": "searching"})
+            _agent_cfg = self._cfg.agents.resolve("ingest")
             agent = IngestAgent(
                 provider=make_provider("ingest", self._cfg),
                 store=self._store, search=self._search,
@@ -138,9 +139,15 @@ class Orchestrator:
                 cache_version=self._cfg.cache.version,
                 fetch_timeout=self._cfg.ingest.fetch_timeout_seconds,
                 decision_max_tokens=self._cfg.ingest.decision_max_tokens,
+                model=_agent_cfg.model,
+                is_local=(_agent_cfg.provider == "ollama"),
             )
+            # The agent finalizes result.cost_usd before it writes the audit
+            # ledger + activity log, so both reflect the real cost (not $0).
             result = await agent.ingest(source, force=force, bust_cache=force)
-            _agent_cfg = self._cfg.agents.resolve("ingest")
+            # Recompute for the job-result path (same value the agent used) so
+            # the queue result stays authoritative even if the agent was given
+            # no pricing info.
             result.cost_usd = estimate_cost(
                 _agent_cfg.model,
                 result.input_tokens,
