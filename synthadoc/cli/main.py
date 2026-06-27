@@ -3,10 +3,21 @@
 from __future__ import annotations
 
 import os
+import sys
 from pathlib import Path
 from typing import Optional
 
 import typer
+
+# Force UTF-8 on stdout/stderr so non-ASCII source titles (em-dashes, "→",
+# CJK, …) don't crash the CLI on Windows consoles that default to cp1252.
+# Without this, printing an enqueue confirmation for a file like
+# "… Doc Intel → BYOB …" raises UnicodeEncodeError mid-command.
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding="utf-8", errors="replace")  # type: ignore[union-attr]
+    except (AttributeError, ValueError):
+        pass
 
 from synthadoc import __version__
 from synthadoc.cli._wiki import (
