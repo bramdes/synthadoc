@@ -999,3 +999,93 @@ async def test_link_expansion_can_be_disabled(tmp_wiki):
                           slug="topic", score=5.0, title="Topic", snippet="")])):
         result = await agent.query("q?")
     assert result.citations == ["topic"]
+
+
+# ── source-layer retrieval ──────────────────────────────────────────────────────
+
+class _StubSources:
+    """Duck-typed SourceSearch for query-agent tests."""
+    def __init__(self, chunks):
+        self._chunks = chunks
+
+    def search(self, terms, top_n=6, per_source_cap=2):
+        return list(self._chunks)[:top_n]
+
+
+@pytest.mark.asyncio
+async def test_source_retrieval_blends_cites_and_rescues_gap(tmp_wiki):
+    """A relevant source excerpt is added to context + citations, and its key-term
+    match rescues an otherwise page-only knowledge gap."""
+    from synthadoc.storage.source_search import SourceChunk
+    store = WikiStorage(tmp_wiki / "wiki")
+    search = HybridSearch(store, tmp_wiki / ".synthadoc" / "embeddings.db")
+    provider = AsyncMock()
+    provider.complete.side_effect = [
+        CompletionResponse(text='["egp budget"]', input_tokens=10, output_tokens=5),
+        CompletionResponse(text="Baseline 22.9M [[2026-05-12 EGP Budget]].",
+                           input_tokens=80, output_tokens=20),
+    ]
+    chunk = SourceChunk(
+        source_id="source.document.2026-05-12.egp-budget",
+        title="2026-05-12 EGP Budget", date="2026-05-12", score=6.0,
+        text="The EGP budget baseline was 9.5 out of 22.9 million.")
+    agent = QueryAgent(provider=provider, store=store, search=search,
+                       gap_score_threshold=2.0, source_search=_StubSources([chunk]),
+                       source_retrieval=True)
+    with patch.object(search, "hybrid_search", new=AsyncMock(return_value=[])):
+        result = await agent.query("How did the EGP budget baseline change?")
+    assert "2026-05-12 EGP Budget" in result.citations   # source cited
+    assert result.knowledge_gap is False                  # gap rescued by source hit
+    prompt = provider.complete.call_args_list[1].kwargs["messages"][0].content
+    assert "22.9 million" in prompt                        # verbatim text in prompt
+    assert "Source excerpts" in prompt
+
+
+@pytest.mark.asyncio
+async def test_source_retrieval_does_not_rescue_offtopic(tmp_wiki):
+    """An off-topic source (no key-term overlap) is neither injected nor allowed to
+    rescue the gap — preserving abstention on out-of-corpus questions."""
+    from synthadoc.storage.source_search import SourceChunk
+    store = WikiStorage(tmp_wiki / "wiki")
+    search = HybridSearch(store, tmp_wiki / ".synthadoc" / "embeddings.db")
+    provider = AsyncMock()
+    provider.complete.side_effect = [
+        CompletionResponse(text='["kubernetes"]', input_tokens=10, output_tokens=5),
+        CompletionResponse(text="No information.", input_tokens=50, output_tokens=10),
+    ]
+    chunk = SourceChunk(source_id="source.document.2026-05-02.condo", title="Condo",
+                        date="2026-05-02", score=6.0,
+                        text="A four-bedroom condo unit assessment.")
+    agent = QueryAgent(provider=provider, store=store, search=search,
+                       gap_score_threshold=2.0, source_search=_StubSources([chunk]),
+                       source_retrieval=True)
+    with patch("synthadoc.agents.query_agent.SearchDecomposeAgent") as mock_sda, \
+         patch.object(search, "hybrid_search", new=AsyncMock(return_value=[])):
+        mock_sda.return_value.decompose = AsyncMock(return_value=["x"])
+        result = await agent.query("What was decided about the kubernetes migration?")
+    assert result.knowledge_gap is True          # not rescued
+    assert "Condo" not in result.citations        # off-topic source not injected
+
+
+@pytest.mark.asyncio
+async def test_source_retrieval_off_by_default(tmp_wiki):
+    """With source_retrieval unset, the source_search is never consulted."""
+    store = WikiStorage(tmp_wiki / "wiki")
+    search = HybridSearch(store, tmp_wiki / ".synthadoc" / "embeddings.db")
+    store.write_page("topic", WikiPage(title="Topic", tags=[], content="Some content.",
+                                       status="", confidence="", sources=[]))
+    provider = AsyncMock()
+    provider.complete.side_effect = [
+        CompletionResponse(text='["x"]', input_tokens=10, output_tokens=5),
+        CompletionResponse(text="ans [[Topic]].", input_tokens=50, output_tokens=10),
+    ]
+    from unittest.mock import MagicMock
+    stub = MagicMock()
+    agent = QueryAgent(provider=provider, store=store, search=search,
+                       gap_score_threshold=0.0, source_search=stub,
+                       source_retrieval=False)
+    with patch.object(search, "hybrid_search", new=AsyncMock(return_value=[SearchResult(
+            slug="topic", score=5.0, title="Topic", snippet="")])):
+        result = await agent.query("q?")
+    stub.search.assert_not_called()
+    assert result.citations == ["topic"]

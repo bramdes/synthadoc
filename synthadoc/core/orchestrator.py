@@ -304,7 +304,11 @@ class Orchestrator:
 
     async def query(self, question: str):
         from synthadoc.agents.query_agent import QueryAgent
+        from synthadoc.storage.source_search import SourceSearch
         _provider = make_provider("query", self._cfg)
+        _source_search = SourceSearch(
+            self._root, chunk_chars=self._cfg.query.source_chunk_chars,
+        )
         result = await QueryAgent(
             provider=_provider,
             store=self._store, search=self._search,
@@ -314,6 +318,10 @@ class Orchestrator:
             max_linked_pages=self._cfg.query.max_linked_pages,
             page_char_budget=self._cfg.query.page_char_budget,
             link_hops=self._cfg.query.link_hops,
+            source_search=_source_search,
+            source_retrieval=self._cfg.query.source_retrieval,
+            source_top_n=self._cfg.query.source_top_n,
+            source_char_budget=self._cfg.query.source_char_budget,
         ).query(question)
         _model = self._cfg.agents.resolve("query").model
         cost_usd = estimate_cost(

@@ -106,6 +106,15 @@ class QueryConfig:
     max_linked_pages: int = 12         # cap on linked pages pulled into context
     page_char_budget: int = 1500       # chars of each page fed to the answering LLM
     link_hops: int = 1                 # how many [[link]] hops to follow
+    # Source-layer retrieval: also search the verbatim fact-tier source text
+    # (kb.db sources → parsed files), not just the consolidated wiki pages.
+    # Pages give relationships/current-state; sources give dated verbatim detail
+    # (figures, quotes) that consolidation drops. See
+    # docs/plans/source-retrieval-query-design-v0.3.md.
+    source_retrieval: bool = False     # blend verbatim source excerpts into context
+    source_top_n: int = 6              # max source passages pulled in
+    source_char_budget: int = 4000     # total chars of source excerpts fed to the LLM
+    source_chunk_chars: int = 800      # target size of each source passage
 
 
 @dataclass
@@ -313,6 +322,10 @@ def _raw_to_config(raw: dict, source_has_agents: bool) -> Config:
         max_linked_pages=q_section.get("max_linked_pages", 12),
         page_char_budget=q_section.get("page_char_budget", 1500),
         link_hops=q_section.get("link_hops", 1),
+        source_retrieval=q_section.get("source_retrieval", False),
+        source_top_n=q_section.get("source_top_n", 6),
+        source_char_budget=q_section.get("source_char_budget", 4000),
+        source_chunk_chars=q_section.get("source_chunk_chars", 800),
     )
 
     # --- queue ---

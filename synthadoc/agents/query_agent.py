@@ -14,6 +14,7 @@ from synthadoc.agents._utils import load_user_context, parse_json_string_array
 from synthadoc.agents.search_decompose_agent import SearchDecomposeAgent
 from synthadoc.providers.base import LLMProvider, Message
 from synthadoc.storage.search import HybridSearch
+from synthadoc.storage.source_search import SourceChunk, SourceSearch
 from synthadoc.storage.wiki import WikiPage, WikiStorage
 
 logger = logging.getLogger(__name__)
@@ -86,7 +87,11 @@ class QueryAgent:
                  follow_links: bool = False,
                  max_linked_pages: int = 12,
                  page_char_budget: int = 1500,
-                 link_hops: int = 1) -> None:
+                 link_hops: int = 1,
+                 source_search: Optional[SourceSearch] = None,
+                 source_retrieval: bool = False,
+                 source_top_n: int = 6,
+                 source_char_budget: int = 4000) -> None:
         self._provider = provider
         self._store = store
         self._search = search
@@ -101,6 +106,13 @@ class QueryAgent:
         self._max_linked_pages = _env_int("SYNTHADOC_MAX_LINKED", max_linked_pages)
         self._page_char_budget = _env_int("SYNTHADOC_PAGE_BUDGET", page_char_budget)
         self._link_hops = _env_int("SYNTHADOC_LINK_HOPS", link_hops)
+        # Source-layer retrieval — search the verbatim fact-tier text too, since a
+        # figure/quote/date that consolidation dropped from the topic pages often
+        # survives in the parsed source. Env vars override for A/B testing.
+        self._source_search = source_search
+        self._source_retrieval = _env_bool("SYNTHADOC_SOURCE_RETRIEVAL", source_retrieval)
+        self._source_top_n = _env_int("SYNTHADOC_SOURCE_TOP_N", source_top_n)
+        self._source_char_budget = _env_int("SYNTHADOC_SOURCE_BUDGET", source_char_budget)
 
     async def decompose(self, question: str) -> list[str]:
         """Break a question into focused sub-questions for independent retrieval.
@@ -248,17 +260,52 @@ class QueryAgent:
             _discriminating_term = ""
             _pages_with_overlap = len(candidates)   # no key terms → skip check
 
-        _gap = self._gap_score_threshold > 0 and (
+        _page_gap = self._gap_score_threshold > 0 and (
             len(candidates) < 3                          # signal 1: too few pages
             or _max_score < self._gap_score_threshold    # signal 2: low BM25 scores
             or _pages_with_overlap < 2                   # signal 3: no dedicated coverage
         )
 
+        # ── Source-layer retrieval ─────────────────────────────────────────────
+        # Search the verbatim fact-tier text too — pages are lossy for dated
+        # figures/quotes, but the parsed source files still carry them. Retrieve
+        # the best passages across the sub-questions (dedup, keep highest score).
+        source_chunks: list[SourceChunk] = []
+        if self._source_retrieval and self._source_search is not None:
+            src_best: dict[tuple[str, str], SourceChunk] = {}
+            for sub_q in sub_questions:
+                for ch in self._source_search.search(
+                        sub_q.lower().split(), top_n=self._source_top_n):
+                    key = (ch.source_id, ch.text[:60])
+                    if key not in src_best or ch.score > src_best[key].score:
+                        src_best[key] = ch
+            source_chunks = sorted(
+                src_best.values(), key=lambda c: c.score, reverse=True
+            )[:self._source_top_n]
+
+        # Keep only source passages that genuinely mention a question key term.
+        # This gates both the context (don't inject off-topic verbatim text into
+        # an out-of-corpus negative → no new hallucination surface) and the gap
+        # rescue below. When the question has no strong key terms we can't
+        # discriminate, so we keep the BM25 order as-is.
+        if _key_terms:
+            source_chunks = [
+                ch for ch in source_chunks
+                if any(t in ch.text.lower() for t in _key_terms)
+            ]
+        # A genuine source hit rescues a page-only gap, so we stop abstaining on
+        # questions the sources can answer. Out-of-corpus negatives are NOT
+        # rescued: their key terms appear in no source, source_chunks is now
+        # empty, so the gap holds and abstention is preserved.
+        _source_key_hits = len(source_chunks)
+        _gap = _page_gap and _source_key_hits < 1
+
         # Always log retrieval quality so operators can tune gap_score_threshold.
         logger.info(
-            "query retrieval — pages=%d, max_score=%.2f, "
-            "discriminating_term=%r, on_topic_pages=%d, gap=%s",
-            len(candidates), _max_score, _discriminating_term, _pages_with_overlap, _gap,
+            "query retrieval — pages=%d, max_score=%.2f, discriminating_term=%r, "
+            "on_topic_pages=%d, sources=%d, source_key_hits=%d, page_gap=%s, gap=%s",
+            len(candidates), _max_score, _discriminating_term, _pages_with_overlap,
+            len(source_chunks), _source_key_hits, _page_gap, _gap,
         )
         if _gap:
             _suggested = await SearchDecomposeAgent(self._provider).decompose(question)
@@ -306,15 +353,47 @@ class QueryAgent:
                         len(candidates), linked_added, self._link_hops)
 
         citations = [slug for slug, _ in context_pages]
-        context = "\n\n".join(
+        pages_ctx = "\n\n".join(
             f"### {p.title}\n{p.content[:self._page_char_budget]}"
             for _slug, p in context_pages
         ) or "No relevant pages found."
 
+        # Append verbatim source excerpts (dated), budgeted separately, and cite
+        # the sources — provenance in evaluations is source-level, and citing the
+        # source id/title maps straight to the gold sources.
+        sources_ctx = ""
+        _used = 0
+        for ch in source_chunks:
+            block = f"#### [{ch.date or 'n.d.'}] {ch.title}\n{ch.text}"
+            if _used + len(block) > self._source_char_budget and sources_ctx:
+                break
+            sources_ctx = f"{sources_ctx}\n\n{block}" if sources_ctx else block
+            _used += len(block)
+            if ch.title not in citations:
+                citations.append(ch.title)
+
+        if sources_ctx:
+            context = (
+                "## Consolidated topic pages (relationships, current state)\n"
+                f"{pages_ctx}\n\n"
+                "## Source excerpts — verbatim, dated "
+                "(authoritative for specific figures, quotes, dates)\n"
+                f"{sources_ctx}"
+            )
+            _instruction = (
+                "Answer using ONLY the material below. Cite the pages or sources "
+                "you use with [[Title]]. When a specific figure, date, quote, or "
+                "attribution is involved, prefer the verbatim source excerpts over "
+                "the consolidated pages."
+            )
+        else:
+            context = pages_ctx
+            _instruction = "Answer using ONLY these wiki pages. Cite with [[PageTitle]]."
+
         resp2 = await self._provider.complete(
             messages=[Message(role="user",
-                content=f"Answer using ONLY these wiki pages. Cite with [[PageTitle]].\n\n"
-                        f"Question: {question}\n\nPages:\n{context}")],
+                content=f"{_instruction}\n\n"
+                        f"Question: {question}\n\n{context}")],
             system=load_user_context(self._wiki_root) or None,
             temperature=0.0,
         )
