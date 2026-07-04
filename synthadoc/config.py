@@ -102,6 +102,10 @@ class IngestConfig:
 @dataclass
 class QueryConfig:
     gap_score_threshold: float = 2.0   # BM25 score below which gap is detected
+    follow_links: bool = True          # read pages that retrieved pages [[link]] to
+    max_linked_pages: int = 12         # cap on linked pages pulled into context
+    page_char_budget: int = 1500       # chars of each page fed to the answering LLM
+    link_hops: int = 1                 # how many [[link]] hops to follow
 
 
 @dataclass
@@ -305,6 +309,10 @@ def _raw_to_config(raw: dict, source_has_agents: bool) -> Config:
     q_section = raw.get("query", {})
     query = QueryConfig(
         gap_score_threshold=q_section.get("gap_score_threshold", 2.0),
+        follow_links=q_section.get("follow_links", True),
+        max_linked_pages=q_section.get("max_linked_pages", 12),
+        page_char_budget=q_section.get("page_char_budget", 1500),
+        link_hops=q_section.get("link_hops", 1),
     )
 
     # --- queue ---

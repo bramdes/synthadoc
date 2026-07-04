@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
@@ -12,12 +14,42 @@ from synthadoc.agents._utils import load_user_context, parse_json_string_array
 from synthadoc.agents.search_decompose_agent import SearchDecomposeAgent
 from synthadoc.providers.base import LLMProvider, Message
 from synthadoc.storage.search import HybridSearch
-from synthadoc.storage.wiki import WikiStorage
+from synthadoc.storage.wiki import WikiPage, WikiStorage
 
 logger = logging.getLogger(__name__)
 
 _MAX_SUB_QUESTIONS = 4
 _MAX_QUESTION_CHARS = 4000
+
+# [[wikilinks]] target slugs (unique per wiki). Capture the slug before any
+# `|display` alias or `#heading` anchor.
+_WIKILINK_RE = re.compile(r"\[\[([^\]|#]+)")
+
+
+def _extract_link_slugs(content: str) -> list[str]:
+    """Ordered, de-duplicated [[slug]] targets referenced in a page's content."""
+    out: list[str] = []
+    seen: set[str] = set()
+    for m in _WIKILINK_RE.finditer(content):
+        s = m.group(1).strip()
+        if s and s not in seen:
+            seen.add(s)
+            out.append(s)
+    return out
+
+
+def _env_bool(name: str, default: bool) -> bool:
+    v = os.environ.get(name)
+    if v is None:
+        return default
+    return v.strip().lower() in ("1", "true", "yes", "on")
+
+
+def _env_int(name: str, default: int) -> int:
+    try:
+        return int(os.environ.get(name, default))
+    except (TypeError, ValueError):
+        return default
 
 # Stopwords excluded when extracting key terms for the content-overlap gap check.
 # Keep this list lean — a false positive (treating a content word as a stopword)
@@ -50,13 +82,25 @@ class QueryAgent:
     def __init__(self, provider: LLMProvider, store: WikiStorage,
                  search: HybridSearch, top_n: int = 8,
                  gap_score_threshold: float = 2.0,
-                 wiki_root: Optional[Path] = None) -> None:
+                 wiki_root: Optional[Path] = None,
+                 follow_links: bool = True,
+                 max_linked_pages: int = 12,
+                 page_char_budget: int = 1500,
+                 link_hops: int = 1) -> None:
         self._provider = provider
         self._store = store
         self._search = search
         self._top_n = top_n
         self._gap_score_threshold = gap_score_threshold
         self._wiki_root = Path(wiki_root) if wiki_root is not None else None
+        # Link expansion — read the pages that retrieved pages link to, since a
+        # cross-page answer often lives one hop away (a topic/entity page links to
+        # the specific meeting/fact pages that BM25 didn't rank directly).
+        # Env vars override so the behaviour can be A/B-tested without a config edit.
+        self._follow_links = _env_bool("SYNTHADOC_FOLLOW_LINKS", follow_links)
+        self._max_linked_pages = _env_int("SYNTHADOC_MAX_LINKED", max_linked_pages)
+        self._page_char_budget = _env_int("SYNTHADOC_PAGE_BUDGET", page_char_budget)
+        self._link_hops = _env_int("SYNTHADOC_LINK_HOPS", link_hops)
 
     async def decompose(self, question: str) -> list[str]:
         """Break a question into focused sub-questions for independent retrieval.
@@ -221,11 +265,50 @@ class QueryAgent:
         else:
             _suggested = []
 
-        citations = [r.slug for r in candidates]
+        # ── Link expansion ─────────────────────────────────────────────────────
+        # Start from the retrieved pages, then follow their [[slug]] links up to
+        # link_hops, adding linked pages the search didn't surface. This lets the
+        # model read the specific meeting/fact pages a topic page points to.
+        context_pages: list[tuple[str, WikiPage]] = []
+        seen_slugs: set[str] = set()
+        for r in candidates:
+            p = self._store.read_page(r.slug)
+            if p is not None:
+                context_pages.append((r.slug, p))
+                seen_slugs.add(r.slug)
+
+        linked_added = 0
+        if self._follow_links and self._max_linked_pages > 0:
+            frontier = list(context_pages)
+            for _hop in range(self._link_hops):
+                if linked_added >= self._max_linked_pages:
+                    break
+                next_frontier: list[tuple[str, WikiPage]] = []
+                for _slug, page in frontier:
+                    if linked_added >= self._max_linked_pages:
+                        break
+                    for target in _extract_link_slugs(page.content):
+                        if linked_added >= self._max_linked_pages:
+                            break
+                        if target in seen_slugs:
+                            continue
+                        linked = self._store.read_page(target)
+                        if linked is None:
+                            continue  # dangling link — nothing to read
+                        seen_slugs.add(target)
+                        context_pages.append((target, linked))
+                        next_frontier.append((target, linked))
+                        linked_added += 1
+                frontier = next_frontier
+                if not frontier:
+                    break
+            logger.info("link expansion — retrieved=%d, linked=%d, hops=%d",
+                        len(candidates), linked_added, self._link_hops)
+
+        citations = [slug for slug, _ in context_pages]
         context = "\n\n".join(
-            f"### {p.title}\n{p.content[:1000]}"
-            for r in candidates
-            if (p := self._store.read_page(r.slug))
+            f"### {p.title}\n{p.content[:self._page_char_budget]}"
+            for _slug, p in context_pages
         ) or "No relevant pages found."
 
         resp2 = await self._provider.complete(

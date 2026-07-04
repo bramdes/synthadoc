@@ -310,6 +310,10 @@ class Orchestrator:
             store=self._store, search=self._search,
             gap_score_threshold=self._cfg.query.gap_score_threshold,
             wiki_root=self._root,
+            follow_links=self._cfg.query.follow_links,
+            max_linked_pages=self._cfg.query.max_linked_pages,
+            page_char_budget=self._cfg.query.page_char_budget,
+            link_hops=self._cfg.query.link_hops,
         ).query(question)
         _model = self._cfg.agents.resolve("query").model
         cost_usd = estimate_cost(

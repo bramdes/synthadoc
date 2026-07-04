@@ -944,3 +944,58 @@ async def test_no_gap_multi_aspect_query_with_generic_corpus_term(tmp_wiki):
     # 4 pages mention "partial" ≥ 2 times → on_topic_pages = 4 ≥ 2 → no gap.
     assert result.knowledge_gap is False
     assert result.suggested_searches == []
+
+
+# ── link expansion ────────────────────────────────────────────────────────────
+
+@pytest.mark.asyncio
+async def test_link_expansion_pulls_in_linked_pages(tmp_wiki):
+    """A retrieved page's [[slug]] links should be read and added to the context.
+
+    Search returns only the topic page; the specific fact page it links to is not
+    retrieved directly, but link-following must pull it into the citations.
+    """
+    store = WikiStorage(tmp_wiki / "wiki")
+    search = HybridSearch(store, tmp_wiki / ".synthadoc" / "embeddings.db")
+    store.write_page("gc-tst-topic", WikiPage(
+        title="GC TST", tags=[], content="Cost thread: see [[gc-tst-0520|the 05-20 meeting]].",
+        status="", confidence="", sources=[]))
+    store.write_page("gc-tst-0520", WikiPage(
+        title="GC TST 05-20", tags=[], content="Accenture PS cost finalised at 5.79M.",
+        status="", confidence="", sources=[]))
+    provider = AsyncMock()
+    provider.complete.side_effect = [
+        CompletionResponse(text='["cost"]', input_tokens=10, output_tokens=5),
+        CompletionResponse(text="It was 5.79M [[gc-tst-0520]].", input_tokens=80, output_tokens=20),
+    ]
+    agent = QueryAgent(provider=provider, store=store, search=search,
+                       gap_score_threshold=0.0, follow_links=True)
+    with patch.object(search, "hybrid_search",
+                      new=AsyncMock(return_value=[SearchResult(
+                          slug="gc-tst-topic", score=5.0, title="GC TST", snippet="")])):
+        result = await agent.query("what was the final GC TST cost?")
+    assert "gc-tst-topic" in result.citations       # retrieved page
+    assert "gc-tst-0520" in result.citations         # pulled in via [[link]]
+
+
+@pytest.mark.asyncio
+async def test_link_expansion_can_be_disabled(tmp_wiki):
+    """With follow_links=False, only the retrieved page is used (no link hop)."""
+    store = WikiStorage(tmp_wiki / "wiki")
+    search = HybridSearch(store, tmp_wiki / ".synthadoc" / "embeddings.db")
+    store.write_page("topic", WikiPage(title="Topic", tags=[], content="See [[fact]].",
+                                       status="", confidence="", sources=[]))
+    store.write_page("fact", WikiPage(title="Fact", tags=[], content="Detail.",
+                                      status="", confidence="", sources=[]))
+    provider = AsyncMock()
+    provider.complete.side_effect = [
+        CompletionResponse(text='["x"]', input_tokens=10, output_tokens=5),
+        CompletionResponse(text="ans", input_tokens=50, output_tokens=10),
+    ]
+    agent = QueryAgent(provider=provider, store=store, search=search,
+                       gap_score_threshold=0.0, follow_links=False)
+    with patch.object(search, "hybrid_search",
+                      new=AsyncMock(return_value=[SearchResult(
+                          slug="topic", score=5.0, title="Topic", snippet="")])):
+        result = await agent.query("q?")
+    assert result.citations == ["topic"]
