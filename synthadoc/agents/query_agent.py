@@ -83,7 +83,7 @@ class QueryAgent:
                  search: HybridSearch, top_n: int = 8,
                  gap_score_threshold: float = 2.0,
                  wiki_root: Optional[Path] = None,
-                 follow_links: bool = True,
+                 follow_links: bool = False,
                  max_linked_pages: int = 12,
                  page_char_budget: int = 1500,
                  link_hops: int = 1) -> None:
