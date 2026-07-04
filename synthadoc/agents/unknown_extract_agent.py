@@ -302,8 +302,9 @@ class UnknownExtractAgent:
         path = path_dir / f"{slug}.md"
         while await self._db.get_unknown(uid) is not None:
             n += 1
-            uid = f"{uid_base}-{n}"
-            path = path_dir / f"{slug}-{n}.md"
+            slug_n = ids.slug_with_suffix(slug, n)
+            uid = ids.unknown_id(entity_id or placeholder_eid, slug_n)
+            path = path_dir / f"{slug_n}.md"
 
         rel_path = str(path.relative_to(self._layout.root)).replace("\\", "/")
         created_at = datetime.now(timezone.utc).isoformat()

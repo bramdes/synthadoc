@@ -98,11 +98,12 @@ async def import_source(
     # Async collision check
     suffix_n = 1
     candidate = base_id
+    final_slug = base_slug
     while await db.source_exists(candidate):
         suffix_n += 1
-        candidate = f"{base_id}-{suffix_n}"
+        final_slug = ids.slug_with_suffix(base_slug, suffix_n)
+        candidate = ids.source_id(source_type, valid_on, final_slug)
     src_id = candidate
-    final_slug = base_slug if suffix_n == 1 else f"{base_slug}-{suffix_n}"
 
     raw_target = layout.source_raw_path(
         source_type, f"{valid_on}-{final_slug}{src_path.suffix}"

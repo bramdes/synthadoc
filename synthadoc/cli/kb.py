@@ -365,7 +365,9 @@ def backfill_cmd(
             candidate = base_id
             while await db.source_exists(candidate):
                 n += 1
-                candidate = f"{base_id}-{n}"
+                candidate = ids.source_id(
+                    source_type, iso_date, ids.slug_with_suffix(base_slug, n)
+                )
             src_id = candidate
 
             if dry_run:

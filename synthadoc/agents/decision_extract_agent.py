@@ -315,10 +315,9 @@ class DecisionExtractAgent:
         path = self._layout.decision_path(decision.decision_date, base_slug)
         while await self._db.get_decision(candidate) is not None:
             n += 1
-            candidate = f"{base_id}-{n}"
-            path = self._layout.decision_path(
-                decision.decision_date, f"{base_slug}-{n}"
-            )
+            slug_n = ids.slug_with_suffix(base_slug, n)
+            candidate = ids.decision_id(decision.decision_date, slug_n)
+            path = self._layout.decision_path(decision.decision_date, slug_n)
         decision_id = candidate
 
         rel_path = str(path.relative_to(self._layout.root)).replace("\\", "/")

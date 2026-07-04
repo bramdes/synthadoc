@@ -109,6 +109,24 @@ def slugify(text: str) -> str:
     return slug[:_SLUG_MAX_LEN].rstrip("-") or slug[:_SLUG_MAX_LEN]
 
 
+def slug_with_suffix(base_slug: str, n: int) -> str:
+    """Append a numeric collision suffix ``-<n>`` to *base_slug*, keeping the
+    result a valid slug within the length cap.
+
+    ``slugify`` caps slugs at :data:`_SLUG_MAX_LEN`, so naively gluing ``-2``
+    onto a slug that is already at the cap yields a 65+ char string that is no
+    longer idempotent under ``slugify`` — every downstream ``_check_slug`` on
+    it then raises ``slug must already be a valid slug``. This trims the base
+    to leave room for the suffix instead, so the result always round-trips.
+    """
+    if n < 1:
+        raise ValueError(f"collision suffix n must be >= 1 (got {n})")
+    suffix = f"-{n}"
+    if len(base_slug) + len(suffix) > _SLUG_MAX_LEN:
+        base_slug = base_slug[: _SLUG_MAX_LEN - len(suffix)].rstrip("-")
+    return f"{base_slug}{suffix}"
+
+
 def _check_date(value: str, field: str) -> None:
     if not _DATE_RE.match(value):
         raise ValueError(f"{field} must be YYYY-MM-DD (got {value!r})")

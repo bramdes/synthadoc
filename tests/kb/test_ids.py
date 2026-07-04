@@ -195,6 +195,35 @@ class TestCollisionSuffix:
         assert ids.with_collision_suffix("foo", lambda x: x in taken) == "foo-4"
 
 
+class TestSlugWithSuffix:
+    def test_short_slug_appends_directly(self):
+        assert ids.slug_with_suffix("foo", 2) == "foo-2"
+
+    def test_rejects_n_below_one(self):
+        with pytest.raises(ValueError):
+            ids.slug_with_suffix("foo", 0)
+
+    def test_at_cap_slug_stays_valid(self):
+        # A slug already at the 64-char cap must not overflow when suffixed —
+        # the result has to remain idempotent under slugify (regression: the
+        # kb-seed collision loop produced 66-char slugs that _check_slug then
+        # rejected with "slug must already be a valid slug").
+        base = ids.slugify("x" * 80)  # capped to 64
+        assert len(base) == 64
+        out = ids.slug_with_suffix(base, 2)
+        assert len(out) <= 64
+        assert out.endswith("-2")
+        assert out == ids.slugify(out)
+
+    def test_source_id_round_trips_after_suffix(self):
+        base = ids.slugify(
+            "2026-05-26-17-05-32-tsd-aml-data-architecture-egp-vs-edac-staging"
+        )
+        sid = ids.source_id("document", "2026-05-26", ids.slug_with_suffix(base, 2))
+        # split_source_id runs _check_slug; must not raise.
+        assert ids.split_source_id(sid)[2].endswith("-2")
+
+
 # ---------------------------------------------------------------------------
 # validators
 # ---------------------------------------------------------------------------
