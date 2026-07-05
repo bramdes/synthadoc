@@ -1068,6 +1068,35 @@ async def test_source_retrieval_does_not_rescue_offtopic(tmp_wiki):
 
 
 @pytest.mark.asyncio
+async def test_source_retrieval_requires_min_distinct_key_terms(tmp_wiki):
+    """A chunk matching only ONE key term is filtered (min_key_terms=2), so a
+    topically-adjacent negative (real entity, wrong specifics) can't inject
+    verbatim text or rescue the gap — the v1.1 negative-abstention guard."""
+    from synthadoc.storage.source_search import SourceChunk
+    store = WikiStorage(tmp_wiki / "wiki")
+    search = HybridSearch(store, tmp_wiki / ".synthadoc" / "embeddings.db")
+    provider = AsyncMock()
+    provider.complete.side_effect = [
+        CompletionResponse(text='["vendor"]', input_tokens=10, output_tokens=5),
+        CompletionResponse(text="There is no information available.", input_tokens=40, output_tokens=8),
+    ]
+    # The question has many key terms; the chunk shares only "vendor".
+    chunk = SourceChunk(source_id="source.document.2026-05-04.rfp", title="RFP Scope",
+                        date="2026-05-04", score=6.0,
+                        text="The vendor onboarding logistics were discussed briefly.")
+    agent = QueryAgent(provider=provider, store=store, search=search,
+                       gap_score_threshold=2.0, source_search=_StubSources([chunk]),
+                       source_retrieval=True, source_min_key_terms=2)
+    with patch("synthadoc.agents.query_agent.SearchDecomposeAgent") as mock_sda, \
+         patch.object(search, "hybrid_search", new=AsyncMock(return_value=[])):
+        mock_sda.return_value.decompose = AsyncMock(return_value=["x"])
+        result = await agent.query(
+            "Which vendor was ultimately selected for the financial spreading evaluation?")
+    assert "RFP Scope" not in result.citations   # single-term match filtered out
+    assert result.knowledge_gap is True           # not rescued -> abstention preserved
+
+
+@pytest.mark.asyncio
 async def test_source_retrieval_off_by_default(tmp_wiki):
     """With source_retrieval unset, the source_search is never consulted."""
     store = WikiStorage(tmp_wiki / "wiki")

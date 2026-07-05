@@ -322,6 +322,7 @@ class Orchestrator:
             source_retrieval=self._cfg.query.source_retrieval,
             source_top_n=self._cfg.query.source_top_n,
             source_char_budget=self._cfg.query.source_char_budget,
+            source_min_key_terms=self._cfg.query.source_min_key_terms,
         ).query(question)
         _model = self._cfg.agents.resolve("query").model
         cost_usd = estimate_cost(

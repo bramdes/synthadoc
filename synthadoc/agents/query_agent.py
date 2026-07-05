@@ -91,7 +91,8 @@ class QueryAgent:
                  source_search: Optional[SourceSearch] = None,
                  source_retrieval: bool = False,
                  source_top_n: int = 6,
-                 source_char_budget: int = 4000) -> None:
+                 source_char_budget: int = 4000,
+                 source_min_key_terms: int = 2) -> None:
         self._provider = provider
         self._store = store
         self._search = search
@@ -113,6 +114,7 @@ class QueryAgent:
         self._source_retrieval = _env_bool("SYNTHADOC_SOURCE_RETRIEVAL", source_retrieval)
         self._source_top_n = _env_int("SYNTHADOC_SOURCE_TOP_N", source_top_n)
         self._source_char_budget = _env_int("SYNTHADOC_SOURCE_BUDGET", source_char_budget)
+        self._source_min_key_terms = _env_int("SYNTHADOC_SOURCE_MIN_KEYTERMS", source_min_key_terms)
 
     async def decompose(self, question: str) -> list[str]:
         """Break a question into focused sub-questions for independent retrieval.
@@ -283,15 +285,19 @@ class QueryAgent:
                 src_best.values(), key=lambda c: c.score, reverse=True
             )[:self._source_top_n]
 
-        # Keep only source passages that genuinely mention a question key term.
-        # This gates both the context (don't inject off-topic verbatim text into
-        # an out-of-corpus negative → no new hallucination surface) and the gap
-        # rescue below. When the question has no strong key terms we can't
-        # discriminate, so we keep the BM25 order as-is.
+        # Keep only source passages that mention enough DISTINCT question key
+        # terms to be genuinely on-topic. A single shared entity name is not
+        # enough — the hard out-of-corpus negatives name real entities, so a
+        # 1-term match lets an adjacent meeting's verbatim text be injected and
+        # answered instead of abstaining. Require source_min_key_terms distinct
+        # matches, capped at how many key terms the question actually has (so a
+        # thin question still allows its lone term). This gates both context
+        # injection and the gap rescue below.
         if _key_terms:
+            _min_kt = max(1, min(self._source_min_key_terms, len(_key_terms)))
             source_chunks = [
                 ch for ch in source_chunks
-                if any(t in ch.text.lower() for t in _key_terms)
+                if sum(1 for t in _key_terms if t in ch.text.lower()) >= _min_kt
             ]
         # A genuine source hit rescues a page-only gap, so we stop abstaining on
         # questions the sources can answer. Out-of-corpus negatives are NOT
@@ -381,10 +387,14 @@ class QueryAgent:
                 f"{sources_ctx}"
             )
             _instruction = (
-                "Answer using ONLY the material below. Cite the pages or sources "
-                "you use with [[Title]]. When a specific figure, date, quote, or "
-                "attribution is involved, prefer the verbatim source excerpts over "
-                "the consolidated pages."
+                "Answer the question using ONLY the material below, and cite what "
+                "you use with [[Title]]. Prefer the verbatim source excerpts over "
+                "the consolidated pages for specific figures, dates, quotes, and "
+                "attributions. IMPORTANT: the excerpts may discuss related topics "
+                "without actually answering the question. If the material does not "
+                "explicitly contain the answer, reply that there is no information "
+                "available on this in the wiki — do not guess, infer, or answer "
+                "from merely related content."
             )
         else:
             context = pages_ctx

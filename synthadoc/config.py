@@ -115,6 +115,10 @@ class QueryConfig:
     source_top_n: int = 6              # max source passages pulled in
     source_char_budget: int = 4000     # total chars of source excerpts fed to the LLM
     source_chunk_chars: int = 800      # target size of each source passage
+    # A source passage must mention this many DISTINCT question key terms to count
+    # as on-topic (else a single shared entity name lets an out-of-corpus negative
+    # pull in adjacent verbatim text and answer instead of abstaining).
+    source_min_key_terms: int = 2
 
 
 @dataclass
@@ -326,6 +330,7 @@ def _raw_to_config(raw: dict, source_has_agents: bool) -> Config:
         source_top_n=q_section.get("source_top_n", 6),
         source_char_budget=q_section.get("source_char_budget", 4000),
         source_chunk_chars=q_section.get("source_chunk_chars", 800),
+        source_min_key_terms=q_section.get("source_min_key_terms", 2),
     )
 
     # --- queue ---
