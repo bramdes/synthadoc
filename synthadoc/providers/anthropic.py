@@ -44,6 +44,16 @@ class AnthropicProvider(LLMProvider):
                 if attempt < _MAX_RETRIES - 1:
                     await asyncio.sleep(2 ** attempt)  # 1 s, 2 s, 4 s backoff (attempt 0 → 1 s)
                 continue
+            except anthropic_lib.BadRequestError as exc:
+                # Newer Claude models (e.g. claude-sonnet-5) reject `temperature`
+                # with 400 "temperature is deprecated for this model". Drop it and
+                # retry rather than failing the whole call. Self-correcting, so no
+                # per-model allowlist to maintain.
+                if "temperature" in str(exc) and "temperature" in kwargs:
+                    del kwargs["temperature"]
+                    last_exc = exc
+                    continue
+                raise
             except Exception:
                 raise
         raise last_exc

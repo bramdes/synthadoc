@@ -48,6 +48,54 @@ async def test_anthropic_provider_propagates_rate_limit_immediately():
 
 
 @pytest.mark.asyncio
+async def test_anthropic_provider_drops_temperature_when_deprecated():
+    """A 400 'temperature is deprecated' (e.g. claude-sonnet-5) is recovered by
+    retrying the call without the temperature parameter."""
+    import anthropic
+    cfg = AgentConfig(provider="anthropic", model="claude-sonnet-5")
+    provider = AnthropicProvider(api_key="test-key", config=cfg)
+    calls: list[dict] = []
+
+    async def flaky(**kwargs):
+        calls.append(dict(kwargs))
+        if len(calls) == 1:
+            raise anthropic.BadRequestError(
+                response=MagicMock(status_code=400), body={},
+                message="`temperature` is deprecated for this model.")
+        m = MagicMock()
+        m.content = [MagicMock(text="ok")]
+        m.usage = MagicMock(input_tokens=3, output_tokens=1)
+        return m
+
+    with patch.object(provider._client.messages, "create", side_effect=flaky):
+        result = await provider.complete(messages=[Message(role="user", content="hi")])
+    assert result.text == "ok"
+    assert len(calls) == 2
+    assert "temperature" in calls[0]       # first attempt sent it
+    assert "temperature" not in calls[1]   # retry dropped it
+
+
+@pytest.mark.asyncio
+async def test_anthropic_provider_propagates_unrelated_bad_request():
+    """A 400 that isn't about temperature must propagate, not loop/retry."""
+    import anthropic
+    cfg = AgentConfig(provider="anthropic", model="claude-sonnet-5")
+    provider = AnthropicProvider(api_key="test-key", config=cfg)
+    calls = 0
+
+    async def bad(**kwargs):
+        nonlocal calls
+        calls += 1
+        raise anthropic.BadRequestError(
+            response=MagicMock(status_code=400), body={}, message="unknown model")
+
+    with patch.object(provider._client.messages, "create", side_effect=bad):
+        with pytest.raises(anthropic.BadRequestError):
+            await provider.complete(messages=[Message(role="user", content="hi")])
+    assert calls == 1  # no retry on unrelated 400
+
+
+@pytest.mark.asyncio
 async def test_anthropic_provider_includes_system_message():
     """System prompt must be forwarded in the kwargs to the Anthropic client."""
     cfg = AgentConfig(provider="anthropic", model="claude-haiku-4-5-20251001")
